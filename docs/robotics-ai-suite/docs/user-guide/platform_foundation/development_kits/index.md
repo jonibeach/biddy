@@ -1,0 +1,130 @@
+# Development Kits
+
+A development kit is a ready-to-use hardware platform that pairs an Intel processor
+with a carrier card and the I/O, sensor, and connectivity interfaces needed to
+prototype and validate robotics workloads. Each kit is documented with its setup
+steps, supported operating systems, and interface configuration so you can bring up
+the hardware and start development quickly.
+
+```{note}
+[![Partnership](../images/partnership.svg)](https://builders.intel.com/ecosystem-engagement/solution-hub/edge-ai-catalog/partner-spotlight?type=system)
+For production grade systems, explore a [catalog of systems offered by our partners](https://builders.intel.com/ecosystem-engagement/solution-hub/edge-ai-catalog/partner-spotlight?type=system).
+```
+
+Select a picture to open the kit's setup and configuration guide or its partner
+product page. The kits with local setup guides have been tested with the Robotics
+AI Suite; partner listings do not imply validation.
+
+::::{grid} 4
+:gutter: 3
+:class-row: development-kit-grid
+
+:::{grid-item-card}
+:img-top: ../images/aaeon-cexd-intrbl.png
+:class-card: development-kit-card
+:link: robinson-bay/index
+:link-type: doc
+:link-alt: AAEON CEXD-INTRBL setup and configuration guide
+:text-align: center
+
+**AAEON CEXD-INTRBL**
+<br><small>Intel® Core™ Ultra Processors</small>
+:::
+
+:::{grid-item-card}
+:img-top: ../images/aaeon-up-nexus-wcl-edge.png
+:class-card: development-kit-card
+:link: up-nexus-wcl-edge/index
+:link-type: doc
+:link-alt: AAEON UP Nexus WCL Edge setup and configuration guide
+:text-align: center
+
+**AAEON UP Nexus WCL Edge**
+<br><small>Intel® Core™ Processors</small>
+:::
+
+:::{grid-item-card}
+:img-top: ../images/aaeon-up-wcl-edge.png
+:class-card: development-kit-card
+:link: up-wcl-edge/index
+:link-type: doc
+:link-alt: AAEON UP WCL Edge setup and configuration guide
+:text-align: center
+
+**AAEON UP WCL Edge**
+<br><small>Intel® Core™ Processors</small>
+:::
+
+:::{grid-item-card}
+:img-top: ../images/asus-nuc-16.png
+:class-card: development-kit-card
+:link: asus-nuc-16/index
+:link-type: doc
+:link-alt: ASUS NUC 16 setup and configuration guide
+:text-align: center
+
+**ASUS NUC 16**
+<br><small>Intel® Core™ Ultra Processors<br>Intel® Core™ Processors</small>
+:::
+
+:::{grid-item-card}
+:img-top: ../images/asrock-rbk-100.jpg
+:img-alt: ASRock Industrial RBK-100 Robotics-in-a-Box Physical AI development kit
+:class-card: development-kit-card
+:link: https://www.asrockind.com/en-gb/RBK-100%20/%20Robotics-in-a-Box
+:link-alt: ASRock Industrial RBK-100 Robotics-in-a-Box product page
+:text-align: center
+
+**ASRock Industrial RBK-100**
+<br><small>Robotics-in-a-Box<br>Intel® Core™ Ultra Series 3 Processors</small>
+:::
+::::
+
+## Supported Operating Systems
+
+The development kits are validated with the following operating systems:
+
+::::{grid} 2
+:gutter: 3
+
+:::{grid-item-card}
+:img-top: ../images/ubuntu-logo.png
+:img-alt: Ubuntu logo
+:class-card: development-kit-card supported-os-card
+:text-align: center
+
+**Canonical Ubuntu**
+<br><small>24.04 LTS (Noble Numbat)<br>64-bit Desktop</small>
+:::
+
+:::{grid-item-card}
+:img-top: ../images/ubuntu-logo.png
+:img-alt: Ubuntu logo
+:class-card: development-kit-card supported-os-card
+:text-align: center
+
+**Canonical Ubuntu**
+<br><small>22.04 LTS (Jammy Jellyfish)<br>64-bit Desktop</small>
+:::
+::::
+
+## Supported Configurations
+
+```{include} ../getting_started/fragment_configurations.md
+```
+
+Use the [Runtime](../../components/runtime/index.md) guidance to configure the ROS 2
+distribution for the selected system profile. Before installing a robot application,
+review its Blueprint for compatible hardware, sensor, firmware, and package
+requirements.
+
+
+:::{toctree}
+:caption: Development Kits
+:hidden:
+
+AAEON CEXD-INTRBL <robinson-bay/index>
+AAEON UP Nexus WCL Edge <up-nexus-wcl-edge/index>
+AAEON UP WCL Edge <up-wcl-edge/index>
+ASUS NUC 16 <asus-nuc-16/index>
+:::

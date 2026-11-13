@@ -1,0 +1,444 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/openvinotoolkit/physicalai/main/docs/assets/physicalai.png" alt="Physical AI" width="100%">
+</p>
+
+<div align="center">
+
+**Runtime package for deploying robot policies trained with [Physical AI Studio](https://github.com/open-edge-platform/physical-ai-studio)**
+
+[Installation](#installation) •
+[Camera API](#camera-api) •
+[Robot API](#robot-api) •
+[Inference](#inference) •
+[Docs](#documentation)
+
+[![PyPI version](https://img.shields.io/pypi/v/physicalai?label=PyPI)](https://pypi.org/project/physicalai/)
+[![Downloads](https://static.pepy.tech/personalized-badge/physicalai?period=total&units=international_system&left_color=grey&right_color=green&left_text=PyPI%20Downloads)](https://pepy.tech/project/physicalai)
+[![License](https://img.shields.io/github/license/openvinotoolkit/physicalai?label=License)](https://github.com/openvinotoolkit/physicalai/blob/main/LICENSE)
+[![OpenSSF Scorecard](https://img.shields.io/ossf-scorecard/github.com/openvinotoolkit/physicalai?label=OpenSSF%20Scorecard)](https://scorecard.dev/viewer/?uri=github.com/openvinotoolkit/physicalai)
+[![Fuzz testing status](https://github.com/openvinotoolkit/physicalai/actions/workflows/fuzz.yml/badge.svg)](https://github.com/openvinotoolkit/physicalai/actions/workflows/fuzz.yml)
+
+</div>
+
+---
+
+Physical AI Runtime provides the deployment-side components for running trained policies on real hardware. It handles camera capture, robot control, and policy inference with a unified API that works across different hardware vendors.
+
+**Key Features:**
+
+- **Unified Camera API** — Same interface for UVC, RealSense, Basler, and IP cameras
+- **Robot Protocol** — Structural typing for any robot; no inheritance required
+- **Inference Engine** — Load exported policies from Studio with auto-detected backends
+- **Robot Runtime** — Control loop with pluggable action sources (policy inference or teleop), observation building, and action dispatch
+
+---
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/0dd0b431-2b7a-4002-b45a-a18e79d113ff" alt="Inference demo" width="100%">
+</p>
+
+## Installation
+
+```bash
+pip install physicalai
+```
+
+With hardware-specific extras:
+
+```bash
+pip install physicalai[realsense]   # Intel RealSense cameras
+pip install physicalai[basler]      # Basler industrial cameras
+```
+
+With first-party plugins (Python 3.12+):
+
+```bash
+pip install "physicalai[so101-plugin]"           # SO-101 robot arm and Studio catalog
+pip install "physicalai[trossen-plugin]"         # Trossen WidowX robots
+pip install "physicalai[plugin-mujoco]"          # simulated robots (MuJoCo)
+pip install "physicalai[plugin-rebot-b601]"      # Seeed reBot B601
+pip install "physicalai[plugin-stararm]"         # Fashion Star Arm 102
+pip install "physicalai[plugin-so101]"           # single-arm and bimanual SO-101
+```
+
+---
+
+## Camera API
+
+All cameras share a unified interface: `connect()`, `read()`, `read_latest()`, and context manager support. Switch hardware without changing application code.
+
+```python
+from physicalai.capture import UVCCamera
+
+with UVCCamera(device="/dev/video0", width=640, height=480, fps=30) as camera:
+    frame = camera.read_latest()
+    print(frame.data.shape)  # (480, 640, 3)
+    print(frame.timestamp)   # monotonic timestamp
+```
+
+<details>
+<summary><strong>Intel RealSense (RGB + Depth)</strong></summary>
+
+```python
+from physicalai.capture import RealSenseCamera
+
+with RealSenseCamera(serial_number="123456789", width=640, height=480, fps=30) as camera:
+    rgb, depth = camera.read_rgbd()
+    print(rgb.data.shape)    # (480, 640, 3) RGB
+    print(depth.data.shape)  # (480, 640) depth in mm
+```
+
+</details>
+
+<details>
+<summary><strong>Basler Industrial Camera</strong></summary>
+
+```python
+from physicalai.capture import BaslerCamera
+
+with BaslerCamera(serial_number="12345678", width=1920, height=1080, fps=60) as camera:
+    frame = camera.read_latest()
+    print(frame.data.shape)  # (1080, 1920, 3)
+```
+
+</details>
+
+<details>
+<summary><strong>IP / Network Camera (RTSP, HTTP)</strong></summary>
+
+```python
+from physicalai.capture import IPCamera
+
+with IPCamera(url="rtsp://user:pass@192.168.1.50:554/stream", width=1280, height=720) as camera:
+    frame = camera.read_latest()
+    print(frame.data.shape)  # (720, 1280, 3)
+```
+
+</details>
+
+<details>
+<summary><strong>Multi-Camera Sync</strong></summary>
+
+```python
+from physicalai.capture import UVCCamera, RealSenseCamera, read_cameras
+
+cameras = {
+    "wrist": UVCCamera(device="/dev/video0"),
+    "overhead": RealSenseCamera(serial_number="123456789"),
+}
+
+# Connect all
+for cam in cameras.values():
+    cam.connect()
+
+# Read from all cameras concurrently
+synced = read_cameras(cameras)
+print(synced.frames["wrist"].data.shape)
+print(synced.frames["overhead"].data.shape)
+
+# Cleanup
+for cam in cameras.values():
+    cam.disconnect()
+```
+
+</details>
+
+<details>
+<summary><strong>Camera Discovery</strong></summary>
+
+```python
+from physicalai.capture import discover_all, UVCCamera
+
+# Discover all connected cameras (returns dict of camera_type -> list of devices)
+all_devices = discover_all()
+for camera_type, devices in all_devices.items():
+    for dev in devices:
+        print(f"{camera_type}: {dev.device_id} - {dev.name}")
+
+# Discover specific type
+uvc_devices = UVCCamera.discover()
+```
+
+</details>
+
+---
+
+## Robot API
+
+Robots implement a Protocol-based interface. Any class with `connect()`, `disconnect()`, `get_observation()`, `send_action()`, and `joint_names` works — no inheritance required.
+
+More robots ship as first-party plugins. Each plugin README covers setup and usage. Install them with the `plugin-*` extras (see [Installation](#installation)); the LeRobot plugin is installed manually with `pip install physicalai-lerobot-plugin`.
+
+| Plugin                                                        | Robots                                                                                                               |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| [MuJoCo](packages/physicalai-mujoco-plugin/README.md)         | Simulated single-arm and bimanual SO-101 and other MuJoCo Menagerie robots, with a browser viewer and camera streams |
+| [SO-101](packages/physicalai-so101-plugin/README.md)          | Single-arm and bimanual SO-101 drivers, Studio catalog, and URDF assets                                              |
+| [reBot B601](packages/physicalai-rebot-b601-plugin/README.md) | Seeed reBot B601-DM / B601-RS followers                                                                              |
+| [Star Arm](packages/physicalai-stararm-plugin/README.md)      | Fashion Star Arm 102 leaders and a follower                                                                          |
+| [LeRobot](packages/physicalai-lerobot-plugin/README.md)       | Robots and teleoperators from LeRobot configs                                                                        |
+
+To add your own robot to Physical AI Studio, see the [Studio plugin](packages/physicalai-studio-plugin/README.md).
+
+```python
+from physicalai_so101_plugin import SO101
+
+robot = SO101(port="/dev/ttyUSB0", calibration="calibration.json")
+robot.connect()
+
+obs = robot.get_observation()
+print(obs.joint_positions)  # [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+print(robot.joint_names)    # ['shoulder_pan', 'shoulder_lift', ...]
+
+robot.send_action(target_positions, goal_time=0.1)
+robot.disconnect()
+```
+
+<details>
+<summary><strong>Trossen WidowX-AI</strong></summary>
+
+```python
+from physicalai_trossen_plugin import WidowXAI
+
+robot = WidowXAI(ip="192.168.1.100")
+robot.connect()
+
+obs = robot.get_observation()
+print(obs.joint_positions)
+
+robot.send_action(target_positions)
+robot.disconnect()
+```
+
+</details>
+
+<details>
+<summary><strong>Bimanual WidowX-AI</strong></summary>
+
+```python
+from physicalai_trossen_plugin import BimanualWidowXAI, WidowXAI
+
+robot = BimanualWidowXAI(
+    left=WidowXAI(ip="192.168.1.100"),
+    right=WidowXAI(ip="192.168.1.101"),
+)
+robot.connect()
+
+obs = robot.get_observation()
+# Joint positions for both arms concatenated
+print(obs.joint_positions.shape)
+
+robot.send_action(bimanual_targets)
+robot.disconnect()
+```
+
+</details>
+
+<details>
+<summary><strong>Robot Verification</strong></summary>
+
+```python
+from physicalai_so101_plugin import SO101
+from physicalai.robot import verify_robot
+
+robot = SO101(port="/dev/ttyUSB0", calibration="calibration.json")
+verify_robot(robot)  # Interactive joint-by-joint check
+```
+
+</details>
+
+---
+
+## Inference
+
+Load exported policies from [Physical AI Studio](https://github.com/open-edge-platform/physical-ai-studio). The `InferenceModel` class auto-detects the backend (OpenVINO or ONNX in this package; companion distributions may contribute additional adapters such as ExecuTorch) and handles action chunking automatically.
+
+```python
+from physicalai.inference import InferenceModel
+
+# Load exported policy
+model = InferenceModel("./exports/act_policy")
+
+# Reset state for new episode
+model.reset()
+
+# Run inference
+action = model.select_action(observation)
+```
+
+<details>
+<summary><strong>With Explicit Backend</strong></summary>
+
+```python
+from physicalai.inference import InferenceModel
+
+# Force specific backend
+model = InferenceModel(
+    "./exports/act_policy",
+    backend="openvino",
+    device="GPU",
+)
+```
+
+</details>
+
+<details>
+<summary><strong>Latency benchmarking</strong></summary>
+
+```python
+import json
+
+from physicalai.benchmark.performance import InferenceLatencyBenchmark
+from physicalai.inference import InferenceModel
+
+model = InferenceModel("./exports/act_policy")
+model.reset()
+benchmark = InferenceLatencyBenchmark(
+        max_iters=100,
+        warmup_iters=2,
+        max_duration=10000,
+    )
+metrics = benchmark.run(model)
+print(json.dumps(metrics, indent=2))
+
+```
+
+</details>
+
+---
+
+## Robot Runtime
+
+The `RobotRuntime` orchestrates the full control loop: connecting hardware, reading cameras, building observations, running inference, and dispatching actions to the robot. It takes a required, pluggable `action_source` — `PolicySource` wraps a trained model, `TeleopSource` drives a follower from a leader arm, or bring your own by implementing the `ActionSource` protocol.
+
+```python
+from physicalai.runtime import RobotRuntime, PolicySource, SyncExecution
+from physicalai.inference import InferenceModel
+from physicalai.capture import UVCCamera, RealSenseCamera
+from physicalai_so101_plugin import SO101
+
+runtime = RobotRuntime(
+    fps=30,
+    robot=SO101(port="/dev/ttyACM0"),
+    action_source=PolicySource(
+        model=InferenceModel("./exports/act_policy"),
+    ),
+    cameras={
+        "wrist": UVCCamera(device="/dev/video0", width=640, height=480),
+        "overhead": RealSenseCamera(serial_number="123456789"),
+    },
+)
+
+with runtime:
+    runtime.run(duration_s=60)
+```
+
+<details>
+<summary><strong>From YAML Config</strong></summary>
+
+```python
+runtime = RobotRuntime.from_config("runtime.yaml")
+runtime.run(duration_s=60)
+```
+
+```yaml
+# runtime.yaml
+runtime:
+  robot:
+    class_path: physicalai_so101_plugin.SO101
+    init_args:
+      port: /dev/ttyACM0
+  action_source:
+    class_path: physicalai.runtime.PolicySource
+    init_args:
+      model:
+        class_path: physicalai.inference.InferenceModel
+        init_args:
+          export_dir: ./exports/act_policy
+      execution:
+        class_path: physicalai.runtime.SyncExecution
+  cameras:
+    wrist:
+      class_path: physicalai.capture.UVCCamera
+      init_args:
+        device: /dev/video0
+        width: 640
+        height: 480
+  fps: 30
+```
+
+</details>
+
+<details>
+<summary><strong>CLI</strong></summary>
+
+```bash
+physicalai run --config runtime.yaml --run.duration_s=60
+```
+
+The runtime package owns the shared `physicalai` executable. Training packages
+can add subcommands such as `fit` and `benchmark` through the
+`physicalai.cli.subcommands` entry-point group.
+
+</details>
+
+<details>
+<summary><strong>Async Execution</strong></summary>
+
+Async execution runs inference in a background thread while the main loop handles camera reads and robot commands at a fixed frequency. Useful when inference is slower than the control rate.
+
+```python
+from physicalai.runtime import RobotRuntime, PolicySource, AsyncExecution
+
+runtime = RobotRuntime(
+    fps=30,
+    robot=robot,
+    action_source=PolicySource(model=model, execution=AsyncExecution()),
+    cameras=cameras,
+)
+
+with runtime:
+    runtime.run(duration_s=60)
+```
+
+</details>
+
+<details>
+<summary><strong>Remote Execution</strong></summary>
+
+Remote inference runs the policy on a separate inference server and returns actions over Zenoh. Use `RemoteInferenceModel` with an existing execution mode such as `AsyncExecution`:
+
+```python
+from physicalai.inference import RemoteInferenceModel
+from physicalai.runtime import RobotRuntime, PolicySource, AsyncExecution
+
+runtime = RobotRuntime(
+    fps=30,
+    robot=robot,
+    action_source=PolicySource(
+        model=RemoteInferenceModel(name="cell1-act"),
+        execution=AsyncExecution(),
+    ),
+    cameras=cameras,
+)
+
+with runtime:
+    runtime.run(duration_s=60)
+```
+
+See [Run Inference Remotely](docs/how-to/runtime/run-inference-remotely.md) for server setup, networking, and client configuration.
+
+</details>
+
+---
+
+> **Full walkthrough:** See [`examples/tutorials/collect_train_deploy.ipynb`](https://github.com/openvinotoolkit/physicalai/blob/main/examples/tutorials/collect_train_deploy.ipynb) for a complete collect -> train -> deploy guide.
+
+---
+
+## Documentation
+
+[Home](https://github.com/openvinotoolkit/physicalai/tree/main/docs) • [Getting Started](https://github.com/openvinotoolkit/physicalai/tree/main/docs/getting-started) • [How-To Guides](https://github.com/openvinotoolkit/physicalai/tree/main/docs/how-to) • [Concepts](https://github.com/openvinotoolkit/physicalai/tree/main/docs/explanation) • [API Reference](https://github.com/openvinotoolkit/physicalai/tree/main/docs/reference)
+
+## Contributing
+
+See [CONTRIBUTING.md](https://github.com/openvinotoolkit/physicalai/blob/main/CONTRIBUTING.md).

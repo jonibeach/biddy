@@ -1,0 +1,235 @@
+# First Deployment
+
+Export your trained policy and run inference in production.
+
+## What You'll Do
+
+1. Export your checkpoint to an optimized format
+2. Load the exported model for inference
+3. Run a control loop
+
+## Prerequisites
+
+- [Trained policy checkpoint](quickstart.md)
+- Export backend installed (OpenVINO, ONNX, or Torch)
+
+## Step 1: Export Your Policy
+
+### Choose a Backend
+
+| Backend      | Best For                                   | Install                |
+| ------------ | ------------------------------------------ | ---------------------- |
+| **OpenVINO** | Intel CPUs, GPUs, NPUs                     | `pip install openvino` |
+| **ONNX**     | NVIDIA GPUs (via TensorRT), cross-platform | `pip install onnx`     |
+| **Torch**    | Edge devices, mobile                       | Built-in               |
+
+### Export with Python
+
+```python test="skip" reason="requires checkpoint"
+from physicalai.policies import ACT
+
+# Load checkpoint
+policy = ACT.load_from_checkpoint(
+    "experiments/lightning_logs/version_0/checkpoints/last.ckpt"
+)
+
+# Export to OpenVINO
+policy.export("./policy_export", backend="openvino")
+```
+
+### Exported Files
+
+```text
+policy_export/
+├── model.xml          # OpenVINO model (or .onnx/.pt for other backends)
+├── model.bin          # Model weights
+├── metadata.yaml      # Policy configuration
+└── metadata.json      # Same as YAML, for programmatic access
+```
+
+## Step 2: Load for Inference
+
+```python test="skip" reason="requires exported model"
+from physicalai.inference import InferenceModel
+
+# Load exported model (auto-detects backend)
+policy = InferenceModel("./policy_export")
+```
+
+The same code works regardless of which backend you exported to.
+
+## Step 3: Run Inference Loop
+
+### Basic Control Loop
+
+```python test="skip" reason="requires exported model and environment"
+from physicalai.inference import InferenceModel
+
+# Load model
+policy = InferenceModel("./policy_export")
+
+# Initialize environment (your robot or simulation)
+obs, info = env.reset()
+
+# Reset policy (clears action queue)
+policy.reset()
+
+# Control loop
+done = False
+while not done:
+    # Get action from policy
+    action = policy.select_action(obs)
+
+    # Execute action
+    obs, reward, terminated, truncated, info = env.step(action)
+    done = terminated or truncated
+```
+
+### With Error Handling
+
+```python test="skip" reason="requires exported model and environment"
+import logging
+from physicalai.inference import InferenceModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+policy = InferenceModel("./policy_export")
+
+try:
+    obs, info = env.reset()
+    policy.reset()
+
+    step = 0
+    max_steps = 300
+
+    while step < max_steps:
+        action = policy.select_action(obs)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        step += 1
+
+        if terminated:
+            logger.info(f"Task completed at step {step}")
+            break
+        if truncated:
+            logger.warning(f"Episode truncated at step {step}")
+            break
+
+except Exception as e:
+    logger.error(f"Inference failed: {e}")
+    raise
+finally:
+    env.close()
+```
+
+## Understanding Action Chunking
+
+Policies like ACT predict multiple future actions at once ("action chunking"). The `InferenceModel` handles this automatically:
+
+```mermaid
+sequenceDiagram
+    participant E as Environment
+    participant P as Policy
+    participant Q as Action Queue
+
+    E->>P: observation
+    P->>Q: predict 10 actions
+    Q->>E: action 1
+    E->>Q: (queue not empty)
+    Q->>E: action 2
+    Note over Q: ...continues until queue empty
+    E->>P: new observation
+    P->>Q: predict 10 more actions
+```
+
+You don't need to manage this—just call `select_action()` every step.
+
+## Performance Optimization
+
+### Warm-up the Model
+
+First inference is slower due to compilation:
+
+```python test="skip" reason="requires exported model and environment"
+policy = InferenceModel("./policy_export")
+
+# Warm-up with dummy observation
+dummy_obs = get_dummy_observation()  # Match your observation format
+_ = policy.select_action(dummy_obs)
+
+# Now inference is fast
+policy.reset()
+obs, _ = env.reset()
+# ... run actual inference
+```
+
+### Measure Latency
+
+`InferenceLatencyBenchmark` handles warm-up, iteration/time budgets, and summary
+statistics:
+
+```python test="skip" reason="requires exported model"
+from physicalai.benchmark.performance import InferenceLatencyBenchmark
+from physicalai.inference import InferenceModel
+
+policy = InferenceModel("./policy_export")
+
+benchmark = InferenceLatencyBenchmark(max_iters=100, warmup_iters=5, max_duration=60000)
+
+# Inputs default to random samples derived from the model's input features
+metrics = benchmark.run(policy)
+
+print(f"Median latency: {metrics['median_iter_time'] * 1000:.2f} ms per action chunk")
+```
+
+Returned metrics are in seconds: `avg_warmup_iter_time`, `num_iters`,
+`min_iter_time`, `max_iter_time`, `mean_iter_time`, `median_iter_time`, and
+`std_iter_time`.
+
+To benchmark with real observations, pass any iterable of input dicts:
+
+```python test="skip" reason="requires exported model and environment"
+metrics = benchmark.run(policy, inputs=(get_observation() for _ in range(105)))
+```
+
+### Tips
+
+1. **Match backend to hardware**: OpenVINO for Intel, ONNX + TensorRT for NVIDIA
+2. **Reuse policy instance**: Don't reload the model every episode
+3. **Keep policy on same device**: Avoid CPU↔GPU transfers during inference
+
+## Real Robot Integration
+
+For real robot deployment, your observation typically includes:
+
+```python test="skip" reason="requires robot hardware"
+# Example observation structure (varies by robot)
+observation = {
+    "image": camera_image,           # RGB image from camera
+    "state": robot.get_joint_positions(),  # Current joint positions
+}
+
+action = policy.select_action(observation)
+
+# Action is typically joint position targets
+robot.move_to(action)
+```
+
+See your robot's documentation for specific observation and action formats.
+
+## What's Next?
+
+- [How-To Guides](../how-to/) for advanced deployment scenarios
+- [Export Design](../explanation/export/README.md) for backend details
+- [Inference Design](../explanation/inference/README.md) for architecture
+
+## Troubleshooting
+
+**"Backend not found"**: Install the required backend (`pip install openvino` or `pip install onnx`)
+
+**Action shape mismatch**: Ensure your observation format matches training data
+
+**Slow inference**: Try a different backend, or ensure you're using GPU if available
+
+**Memory issues**: Export with a smaller batch size or use a lighter policy
