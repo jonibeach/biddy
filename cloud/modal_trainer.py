@@ -23,7 +23,11 @@ import os
 import modal
 
 TRAINER_TAG = "0.3.0-dev-8f132416"  # matches ~/physical-ai-studio at 8f13241
-GPU = os.environ.get("BIDDY_GPU", "L40S")  # 48 GB; SmolVLA/ACT fit easily
+# H100 (80 GB) trains SmolVLA about twice as fast as an L40S for a similar total
+# cost. BIDDY_GPU=none deploys on CPU only: a smoke test of the image, the
+# secret path and Studio's health check without GPU billing.
+GPU = os.environ.get("BIDDY_GPU", "H100")
+GPU = None if GPU.lower() == "none" else GPU
 SCALEDOWN_S = 20 * 60
 STORAGE = "/var/lib/physicalai-trainer"
 

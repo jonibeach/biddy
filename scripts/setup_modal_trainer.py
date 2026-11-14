@@ -48,7 +48,9 @@ def studio(method: str, path: str, body: dict | None = None, timeout: float = 60
 def modal(*args: str, capture: bool = False) -> str:
     cmd = ["modal", *args]
     if capture:
-        out = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True, text=True)
+        out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+        if out.returncode:
+            sys.exit(f"{' '.join(cmd[:3])} failed:\n{(out.stdout + out.stderr)[-2000:]}")
         return out.stdout + out.stderr
     subprocess.run(cmd, cwd=ROOT, check=True)
     return ""
@@ -58,8 +60,18 @@ def deploy() -> str:
     """Deploy and return the full trainer URL (with its secret path)."""
     saved = json.loads(URL_FILE.read_text()) if URL_FILE.exists() else {}
     secret = saved.get("secret") or secrets.token_urlsafe(32)
-    # --force replaces the value if the secret already exists; the value is never printed.
-    modal("secret", "create", "biddy-trainer", f"TRAINER_PATH_SECRET={secret}", "--force", capture=True)
+    # From a private temp file, not argv (other users can read process arguments);
+    # --force replaces the value if the secret exists. The value is never printed.
+    import os
+    import tempfile
+
+    fd, env_file = tempfile.mkstemp(suffix=".env")
+    try:
+        os.write(fd, f"TRAINER_PATH_SECRET={secret}\n".encode())
+        os.close(fd)
+        modal("secret", "create", "biddy-trainer", "--from-dotenv", env_file, "--force", capture=True)
+    finally:
+        os.unlink(env_file)
     out = modal("deploy", "cloud/modal_trainer.py", capture=True)
     print(out[-1500:])
     m = re.search(r"https://\S+?\.modal\.run", out)

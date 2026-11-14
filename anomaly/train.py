@@ -54,7 +54,11 @@ def heldout_images(datamodule) -> list[tuple[str, int]]:
     seen = {}
     for ds in (datamodule.val_data, datamodule.test_data):
         for _, row in ds.samples.iterrows():
-            seen[str(row["image_path"])] = int(row["label_index"])
+            path = str(row["image_path"])
+            # With nothing held out, Anomalib splits train_good itself: never score
+            # a rotated copy of a training crop as if it were unseen.
+            if not Path(path).name.startswith(AUG_PREFIX):
+                seen[path] = int(row["label_index"])
     return sorted(seen.items())
 
 
@@ -128,6 +132,11 @@ def stage(data: Path, stage_dir: Path, holdout: float, copies: int) -> tuple[lis
     keys = sorted({episode_key(p) for p in good})
     every = max(2, round(1 / holdout)) if holdout > 0 else 0
     held = {k for i, k in enumerate(keys) if every and i % every == every - 1}
+    if every and not held and len(keys) >= 2:
+        held = {keys[-1]}  # fewer episodes than 1/holdout: still keep one out
+    if every and not held:
+        sys.exit(f"need good crops from at least 2 episodes to hold one out (found {len(keys)}); "
+                 "record more, or pass --holdout 0 to train without checking the threshold on unseen bricks")
     train = [p for p in good if episode_key(p) not in held]
     test = [p for p in good if episode_key(p) in held]
     shutil.rmtree(stage_dir, ignore_errors=True)
@@ -219,6 +228,9 @@ def main():
             root=work / "stage",
             normal_dir="train_good",
             normal_test_dir="test_good" if test else None,
+            # Nothing held out (--holdout 0): don't let Anomalib carve a test set out
+            # of train_good, which holds rotated copies of the training crops.
+            normal_split_ratio=0.2 if test else 0.0,
             abnormal_dir="defective" if bad else None,
             train_batch_size=batch_size,
             eval_batch_size=batch_size,

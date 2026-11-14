@@ -155,8 +155,9 @@ class Watcher:
     end="home":  stop when the arm has left home and is back there, still (the
                  whole demo ran; with no inspection hold it was a missed grasp).
     end="holds": stop once `holds` inspection holds have been scored, or as
-                 soon as a face fails (the policy hands over to a drop policy
-                 or scripted drop).
+                 soon as a face has failed and the brick has been held at the
+                 inspection camera (it is grasped); then the drop policy or the
+                 scripted drop takes over.
     """
 
     # Studio's normalized joint ranges: body joints -100..100, gripper 0..100.
@@ -225,9 +226,13 @@ class Watcher:
             self.home_still = self.home_still + 1 if at_home and still else 0
             if self.left_home and self.home_still >= self.hold_ticks:
                 self._finish()
-        elif self.end == "holds" and (self.inspector.verdict.holds >= self.holds_wanted
-                                      or self.inspector.switched):  # a failed face: no need to see the rest
-            self._finish()
+        elif self.end == "holds":
+            v = self.inspector.verdict
+            # A failed face ends the pick early, but only once the brick is in the
+            # gripper: a defect seen by the wrist camera during the hover comes
+            # before the grasp, and handing over then would drop an empty gripper.
+            if v.holds >= self.holds_wanted or (self.inspector.switched and v.holds >= 1):
+                self._finish()
 
     def _finish(self):
         self.done = True

@@ -68,7 +68,7 @@ case "$cmd" in
     "$SELF" bench --policy
     ;;
   cloud-trainer)
-    command -v modal >/dev/null || die "Modal CLI missing: uv tool install modal && modal token new"
+    command -v modal >/dev/null || die "Modal CLI missing: uv tool install modal --with python-dotenv && modal token new"
     need_studio_py; "$STUDIO_PY" scripts/setup_modal_trainer.py "$@" ;;
   train-policy) need_studio_py; "$STUDIO_PY" -m cell.train_policy --config "$CONFIG" "$@" ;;
   bench)   need_studio_py; "$STUDIO_PY" -m cell.bench --config "$CONFIG" "$@" ;;
