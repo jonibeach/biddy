@@ -29,7 +29,7 @@ from cell import dataset as dataset_mod
 from cell import studio
 
 
-def api(url: str, method: str = "GET", body: dict | None = None):
+def api(url: str, method: str = "GET", body: dict | None = None, exit_on_error: bool = True):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     try:
@@ -37,7 +37,10 @@ def api(url: str, method: str = "GET", body: dict | None = None):
             text = r.read().decode()
             return json.loads(text) if text else None
     except urllib.error.HTTPError as e:
-        raise SystemExit(f"Studio API {method} {url} -> {e.code}: {e.read().decode()[:2000]}") from None
+        msg = f"Studio API {method} {url} -> {e.code}: {e.read().decode()[:2000]}"
+        if exit_on_error:
+            raise SystemExit(msg) from None
+        raise RuntimeError(msg) from None
     except urllib.error.URLError as e:
         raise SystemExit(f"cannot reach Studio at {url} ({e.reason}); start it with scripts/studio.sh") from None
 
@@ -112,6 +115,9 @@ def main():
     ap.add_argument("--trainer", help="remote trainer name or id; default trains locally")
     ap.add_argument("--device", help="local only: xpu or cpu (default: Studio picks)")
     ap.add_argument("--augment", action="store_true", help="image augmentation (helps new brick positions)")
+    ap.add_argument("--num-workers", type=int, help="DataLoader workers (default: Studio's auto = min(cpus, 8)). "
+                    "The cloud trainer has 24 cores: 16 keeps an H100 fed when augmenting")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the policy (try on a short run first)")
     ap.add_argument("--no-wait", action="store_true", help="submit and return")
     args = ap.parse_args()
 
@@ -135,10 +141,13 @@ def main():
         "model_name": name,
         "batch_size": args.batch_size,
         "augment_images": args.augment,
+        "compile_model": args.compile,
         "export_backends": ["openvino"],
     }
     if args.epochs:
         payload["max_epochs"] = args.epochs
+    if args.num_workers is not None:
+        payload["num_workers"] = args.num_workers
     if args.trainer:
         payload["training_target"] = "remote"
         payload["remote_trainer_id"] = find_trainer(args.trainer, db)
@@ -146,7 +155,25 @@ def main():
         payload["training_target"] = "local"
         if args.device:
             payload["device"] = {"type": args.device, "index": 0 if args.device == "xpu" else None}
-    job = api(f"{base}/api/jobs:train", "POST", payload)
+    if args.trainer:
+        # A cloud trainer may be scaled to zero. Studio gives it only 10 s to list its
+        # policies before accepting a job, and a cold container needs longer: wake it
+        # first, and retry once if that check still times out.
+        print("waking the remote trainer (a cold GPU container takes a minute or two)...")
+        for _ in range(10):
+            health = api(f"{base}/api/remote-trainers/{payload['remote_trainer_id']}/health")
+            if health and health.get("status") == "healthy":
+                break
+            time.sleep(15)
+        else:
+            sys.exit(f"remote trainer not healthy: {health}")
+    try:
+        job = api(f"{base}/api/jobs:train", "POST", payload, exit_on_error=False)
+    except RuntimeError as e:
+        if "Cannot verify available policies" not in str(e):
+            sys.exit(str(e))
+        time.sleep(20)
+        job = api(f"{base}/api/jobs:train", "POST", payload)
     print(f"submitted job {job['id']}: {args.policy} '{name}' on {args.trainer or 'local'}")
     if args.no_wait:
         return
