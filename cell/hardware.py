@@ -127,6 +127,8 @@ class MockCamera:
         self.name = name
         self.width, self.height = width, height
         paths = sorted(p for p in Path(folder).rglob("*") if p.suffix.lower() in {".png", ".jpg"}) if folder else []
+        # Shuffled (fixed seed) so good and defective bricks are mixed like on the table.
+        np.random.default_rng(0).shuffle(paths)
         self.paths = paths
         self._cycle = itertools.cycle(paths) if paths else None
         self._seq = 0
@@ -168,30 +170,80 @@ class MockCamera:
         self.disconnect()
 
 
-class MockPolicy:
-    """Stands in for InferenceModel: heads for a target pose in small steps.
+class MockInspectionCamera(MockCamera):
+    """Shows the current brick image only while the arm is at the inspect pose.
 
-    The target is the inspect pose until `set_task` switches to a bowl task,
-    then the matching bowl pose, so task_switch mode can be exercised.
+    Away from it the camera sees the empty background, like the real station,
+    so the cell's brick-presence check and re-grasp path can be exercised.
+    `miss_every` makes every n-th pick come up empty (a failed grasp).
     """
 
-    def __init__(self, poses: dict[str, np.ndarray], tasks: dict[str, str], chunk: int = 10, step: float = 4.0):
-        self.poses = poses
-        self.tasks = tasks
-        self.chunk = chunk
-        self.step = step
-        self.task = tasks["good"]
-        self.inspected = False
+    def __init__(self, name, folder, arm, inspect_pose, tolerance=10.0, miss_every=0, **kw):
+        super().__init__(name, folder, **kw)
+        self.arm, self.inspect_pose, self.tolerance = arm, np.asarray(inspect_pose, np.float32), tolerance
+        self.miss_every = miss_every
+        self.picks = 0
+        self.background = np.full((self.height, self.width, 3), 60, np.uint8)
 
-    def target(self) -> np.ndarray:
-        if not self.inspected:
-            return self.poses["inspect"]
-        bowl = "defective" if self.task == self.tasks["defective"] else "good"
-        return self.poses[f"{bowl}_bowl"]
+    def advance(self):
+        super().advance()
+        self.picks = getattr(self, "picks", 0) + 1
+        self.retried = False
 
-    def predict_action_chunk(self, state: np.ndarray) -> np.ndarray:
-        actions, pos = [], np.asarray(state, np.float32).copy()
+    def regrasp(self):
+        """The cell is picking again after a miss: this time the grasp works."""
+        self.retried = True
+
+    def read_latest(self) -> MockFrame:
+        self._seq += 1
+        pos = self.arm._pos  # no get_observation(): that would advance the mock servo
+        at_inspect = float(np.max(np.abs(pos[:5] - self.inspect_pose[:5]))) <= self.tolerance
+        missed = self.miss_every and self.picks % self.miss_every == 0 and not getattr(self, "retried", False)
+        img = self._img if at_inspect and not missed else self.background
+        if img.shape[:2] != (self.height, self.width):
+            canvas = self.background.copy()
+            h, w = img.shape[:2]
+            y, x = (self.height - h) // 2, (self.width - w) // 2
+            canvas[y:y + h, x:x + w] = img
+            img = canvas
+        return MockFrame(img, time.monotonic(), self._seq)
+
+
+class MockPolicy:
+    """Stands in for InferenceModel: walks toward a target pose in small steps.
+
+    Mimics a demo: go to the inspect pose with the gripper closed, pause there
+    for `hold_s`, then carry on to the bowl named by the task text and open
+    the gripper. It reads the task from the observation like a real VLA.
+    """
+
+    def __init__(self, poses: dict[str, np.ndarray], tasks: dict[str, str], chunk: int = 10,
+                 step: float = 4.0, hold_s: float = 1.0, fps: float = 30.0):
+        self.poses, self.tasks = poses, tasks
+        self.chunk, self.step = chunk, step
+        self.hold_steps = int(hold_s * fps)
+        self.reset()
+
+    def reset(self):
+        self.held = 0
+
+    def _target(self, pos: np.ndarray, task: str | None) -> np.ndarray:
+        inspect = self.poses["inspect"].copy()
+        inspect[5] = 5.0  # holding the brick
+        if self.held < self.hold_steps:
+            if float(np.max(np.abs(pos[:5] - inspect[:5]))) <= 2.0:
+                self.held += 1
+            return inspect
+        bowl = "defective_bowl" if task == self.tasks["defective"] else "good_bowl"
+        target = self.poses[bowl].copy()
+        target[5] = 5.0 if float(np.max(np.abs(pos[:5] - target[:5]))) > 2.0 else 60.0
+        return target
+
+    def predict_action_chunk(self, obs: dict) -> np.ndarray:
+        pos = np.asarray(obs["state"], np.float32).reshape(-1)[:6].copy()
+        task = (obs.get("task") or [None])[0]
+        actions = []
         for _ in range(self.chunk):
-            pos = pos + np.clip(self.target() - pos, -self.step, self.step)
+            pos = pos + np.clip(self._target(pos, task) - pos, -self.step, self.step)
             actions.append(pos.copy())
         return np.stack(actions)

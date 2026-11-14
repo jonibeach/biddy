@@ -36,10 +36,17 @@ inspection:
   pose_tolerance: 10.0
   still_speed: 15.0        # max joint speed (units/s) to count as still
   frames: 3                # score this many frames and use the median
-  # Re-grasp: if the inspection crop looks like no brick (score above this) the
-  # arm goes home and the policy picks again, up to max_regrasps times.
-  empty_score: null
-  max_regrasps: 1
+  # Re-grasp: the inspection crop is compared with the empty view grabbed while
+  # the arm is at home. Mean pixel difference (0-255) below presence_diff means
+  # no brick in the gripper: go home and pick again, up to max_regrasps times.
+  presence_diff: 12.0
+  max_regrasps: 2
+  # Second look: a score this close to the threshold is re-scored on fresh
+  # frames before deciding, instead of trusting one borderline reading.
+  uncertain_margin: 0.05
 
-home_after_drop: true
+scripted:
+  speed: 80.0              # units/s for scripted moves
+  gripper_open: 60.0       # gripper value that releases the brick
+
 runs_dir: runs
