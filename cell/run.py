@@ -196,6 +196,7 @@ class Watcher:
         self.state: np.ndarray | None = None
         self.home_still = 0
         self.left_home = False
+        self.left_home_at: float | None = None
         self.motion: list[tuple] = []  # (t, state, action_sent, loop_s, sleep_s, stale) per tick
         self.speed_ema = 0.0
         self.saved_near = 0
@@ -253,9 +254,16 @@ class Watcher:
             self.sent += 1
 
         if self.end == "home":
-            at_home = self.home is not None and near(state, self.home, float(self.cfg["home_tolerance"]))
-            self.left_home = self.left_home or not at_home
-            self.home_still = self.home_still + 1 if at_home and still else 0
+            tol = float(self.cfg["home_tolerance"])
+            at_home = self.home is not None and near(state, self.home, tol)
+            # "Left home" means really going somewhere: a shake at the start (a few
+            # units, back again) once ended the brick after 1-4 s. Back home must be
+            # still by the strict demo speed, not the lenient live hold speed.
+            if self.home is not None and not near(state, self.home, max(20.0, 2 * tol)):
+                self.left_home_at = self.left_home_at or now
+            self.left_home = self.left_home_at is not None and now - self.left_home_at >= 5.0
+            home_still = self.speed_ema <= float(self.cfg["still_speed"])
+            self.home_still = self.home_still + 1 if at_home and home_still else 0
             if self.left_home and self.home_still >= self.hold_ticks:
                 self._finish()
         elif self.end == "holds":

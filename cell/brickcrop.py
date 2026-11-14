@@ -21,7 +21,8 @@ import numpy as np
 
 DIFF = 35          # per-pixel change against the empty view (0-255) that counts as "something there"
 MIN_AREA = 600     # px; smaller blobs are noise or a sliver of brick at the frame edge
-MARGIN = 0.15      # of the box size, on every side
+MARGIN = 0.15
+MASK_GREY = 128    # fill outside the brick when a view sets mask: true      # of the box size, on every side
 
 
 def brick_mask(rgb: np.ndarray, background: np.ndarray) -> np.ndarray:
@@ -90,9 +91,31 @@ def brick_box(rgb: np.ndarray, background: np.ndarray, roi: list[int] | None = N
     return [bx, by, side, side]
 
 
-def brick_crop(rgb: np.ndarray, background: np.ndarray, roi: list[int] | None = None) -> np.ndarray | None:
+def brick_crop(rgb: np.ndarray, background: np.ndarray, roi: list[int] | None = None,
+               mask_background: bool = False) -> np.ndarray | None:
+    """Square crop around the brick, or None.
+
+    mask_background: paint everything outside the brick's outline flat grey, so
+    the anomaly model compares brick surface with brick surface instead of the
+    cardboard, jaws and mount behind it, which change from hold to hold.
+    """
     box = brick_box(rgb, background, roi)
     if box is None:
         return None
     x, y, w, h = box
-    return rgb[y:y + h, x:x + w]
+    out = rgb[y:y + h, x:x + w]
+    if not mask_background:
+        return out
+    H, W = rgb.shape[:2]
+    rx, ry, rw, rh = roi if roi else (0, 0, W, H)
+    rx, ry = max(0, rx), max(0, ry)
+    rx1, ry1 = min(W, rx + rw), min(H, ry + rh)
+    blob = _largest_blob(brick_mask(rgb[ry:ry1, rx:rx1], background[ry:ry1, rx:rx1]))
+    full = np.zeros((H, W), np.uint8)
+    full[ry:ry1, rx:rx1] = blob[1].astype(np.uint8) * 255
+    # A little margin so the brick's own edges (where chips and marks show) stay in.
+    full = cv2.dilate(full, np.ones((9, 9), np.uint8))
+    keep = full[y:y + h, x:x + w] > 0
+    out = out.copy()
+    out[~keep] = MASK_GREY
+    return out

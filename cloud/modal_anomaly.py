@@ -29,6 +29,8 @@ import modal
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = "/root/biddy"
 GPU = os.environ.get("BIDDY_ANOMALY_GPU", "L4")
+# Which crops to train on (relative to the repo); e.g. BIDDY_ANOMALY_DATA=data/anomaly_masked.
+DATA = os.environ.get("BIDDY_ANOMALY_DATA", "data/anomaly")
 
 # Same versions as anomaly/.venv on the laptop, with CUDA instead of XPU torch.
 image = (
@@ -46,7 +48,7 @@ image = (
     .env({"TMPDIR": "/tmp", "PYTHONUNBUFFERED": "1"})
     .add_local_file(ROOT / "anomaly/train.py", f"{REMOTE}/anomaly/train.py")
     .add_local_dir(ROOT / "cell", f"{REMOTE}/cell", ignore=["__pycache__", "**/__pycache__"])
-    .add_local_dir(ROOT / "data/anomaly", f"{REMOTE}/data/anomaly")
+    .add_local_dir(ROOT / DATA, f"{REMOTE}/data/anomaly")
 )
 app = modal.App("biddy-anomaly")
 
@@ -81,11 +83,11 @@ def main(views: str = "", args: str = "", dest: str = "models/modal"):
     import shlex
 
     if not views:  # every view with crops (the modal CLI's own Python has no PyYAML for station.yaml)
-        views = ",".join(sorted(p.parent.name for p in (ROOT / "data/anomaly").glob("*/good")))
+        views = ",".join(sorted(p.parent.name for p in (ROOT / DATA).glob("*/good")))
     names = [v for v in views.split(",") if v]
-    missing = [v for v in names if not (ROOT / "data/anomaly" / v / "good").is_dir()]
+    missing = [v for v in names if not (ROOT / DATA / v / "good").is_dir()]
     if missing:
-        raise SystemExit(f"no data/anomaly/<view>/good for: {', '.join(missing)}")
+        raise SystemExit(f"no {DATA}/<view>/good for: {', '.join(missing)}")
     extra = shlex.split(args)
     print(f"training {', '.join(names)} on {GPU}")
     t0 = time.time()

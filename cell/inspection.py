@@ -168,7 +168,8 @@ def view_crop(rgb: np.ndarray, view_cfg: dict) -> np.ndarray:
 def score_crop(rgb: np.ndarray, view_cfg: dict, background: np.ndarray | None) -> np.ndarray | None:
     """The image Anomalib scores for a hold.
 
-    crop: brick  -> a square around the brick found inside roi (cell/brickcrop.py);
+    crop: brick  -> a square around the brick found inside roi (cell/brickcrop.py), with
+                    everything outside the brick painted grey if the view sets mask: true;
                     needs the camera's full empty frame; None if no brick is found.
     otherwise    -> the fixed roi box.
     """
@@ -177,7 +178,7 @@ def score_crop(rgb: np.ndarray, view_cfg: dict, background: np.ndarray | None) -
             return None
         from cell.brickcrop import brick_crop
 
-        return brick_crop(rgb, background, view_cfg.get("roi"))
+        return brick_crop(rgb, background, view_cfg.get("roi"), mask_background=bool(view_cfg.get("mask")))
     return view_crop(rgb, view_cfg)
 
 
