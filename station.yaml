@@ -27,36 +27,49 @@ policy:
     pick: null
     good: put the brick in the good bowl
     defective: put the brick in the defective bowl
-  # How the brick gets into the bowl after inspection:
-  #   task_switch: keep running the policy, switching its task to the verdict's bowl
-  #   scripted:    stop the policy at the inspection pose and replay recorded bowl poses
+  # How the brick gets into the bowl (docs/data_collection.md protocol):
+  #   task_switch: the policy runs the whole demo (hover, inspect, regrasp,
+  #                inspect, drop, home); the cell scores every hold on the fly
+  #                and switches the task to the defective bowl as soon as a
+  #                face fails, which is before the drop.
+  #   scripted:    the policy stops after `scripted.after_holds` inspection
+  #                holds and the arm replays the recorded bowl pose.
   drop: task_switch
-  pick_timeout_s: 30       # give up reaching the inspection pose after this long
-  drop_timeout_s: 20       # task_switch: stop the policy after this long past inspection
+  episode_timeout_s: 60    # one brick, home to home; the demos take 30-40 s
 
 inspection:
-  model: models/anomaly-int8  # anomaly/train.py --int8 output (NNCF INT8); models/anomaly for FP
-  # Policy on the GPU, inspection on the NPU, control loop on the CPU: the two
-  # models never compete for the same accelerator. GPU is fastest if the NPU
-  # is busy or missing; `python -m cell.anomaly <model> --bench` compares them.
+  # Policy on the GPU, inspection on the NPU, control loop on the CPU: the
+  # models never compete for one accelerator. `./biddy bench` compares devices.
   device: NPU
-  camera: inspection
-  roi: null                # [x, y, w, h] crop in the 640x480 image; set with anomaly/roi.py
-  # The arm counts as "at inspection" when every body joint is within this many
-  # normalized units (-100..100 scale) of the inspect pose and nearly still.
-  pose_tolerance: 10.0
-  still_speed: 15.0        # max joint speed (units/s) to count as still
-  frames: 3                # score this many frames and use the median
-  # Re-grasp: the inspection crop is compared with the empty view grabbed while
-  # the arm is at home. Mean pixel difference (0-255) below presence_diff means
-  # no brick in the gripper: go home and pick again, up to max_regrasps times.
+  # One Anomalib model per camera view. The inspection camera sees back,
+  # bottom and both sides; the wrist camera sees top and front during the
+  # hover before the grasp. A view is used when its model folder exists.
+  # roi: [x, y, w, h] in the 640x480 image (./biddy roi --view <view> <image>).
+  views:
+    inspection:
+      camera: inspection
+      roi: null
+      model: models/inspection-int8
+    wrist:
+      camera: wrist
+      roi: null
+      model: models/wrist-int8
+  # A hold: the arm still (joint speed below still_speed, units/s) for at least
+  # hold_min_s, away from home (any body joint further than home_tolerance).
+  still_speed: 15.0
+  hold_min_s: 0.3
+  home_tolerance: 8.0
+  # The brick is at the inspection camera when its crop differs from the empty
+  # view (grabbed at home) by at least presence_diff (mean pixel difference).
   presence_diff: 12.0
+  frames: 3                # frames scored per hold; the median counts
+  # A brick whose run ends with no inspection hold was not grasped: pick again.
   max_regrasps: 2
-  # Second look: a score this close to the threshold is re-scored on fresh
-  # frames before deciding, instead of trusting one borderline reading.
+  # Verdicts this close to a threshold are logged as uncertain.
   uncertain_margin: 0.05
 
 scripted:
+  after_holds: 4           # back, bottom, side, side
   speed: 80.0              # units/s for scripted moves
   gripper_open: 60.0       # gripper value that releases the brick
 

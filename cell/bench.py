@@ -91,7 +91,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="station.yaml")
     ap.add_argument("--policy", nargs="*", help="policy specs (default: policy.model and policy.drop_model)")
-    ap.add_argument("--anomaly", nargs="*", help="anomaly model dirs (default: inspection.model)")
+    ap.add_argument("--anomaly", nargs="*", help="anomaly model dirs (default: every inspection view's model)")
     ap.add_argument("--runs", type=int, default=30)
     args = ap.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -107,7 +107,8 @@ def main():
             print(f"skip policy {spec}: {e}")
             continue
         rows += bench_policy(export_dir, cfg["policy"]["tasks"]["good"], devs, args.runs)
-    for d in args.anomaly if args.anomaly is not None else [cfg["inspection"]["model"]]:
+    default_models = [v["model"] for v in cfg["inspection"]["views"].values()]
+    for d in args.anomaly if args.anomaly is not None else default_models:
         if not (Path(d) / "model.xml").exists():
             print(f"skip anomaly {d}: no model.xml")
             continue

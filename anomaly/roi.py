@@ -1,11 +1,12 @@
 """Pick the inspection crop (ROI) by dragging a box, and save it to station.yaml.
 
-    python anomaly/roi.py data/anomaly/good/some_full_frame.png
-    python anomaly/roi.py --camera     # grab a live frame from the inspection camera
+    python anomaly/roi.py --view inspection data/anomaly/inspection/good/<full frame>.png
+    python anomaly/roi.py --view wrist --camera     # grab a live frame from that view's camera
 
-Drag a box around where the brick sits when held at the inspection pose, with
-a little margin, then press Enter (c cancels). Get a full frame first with
-`anomaly/extract.py --no-crop` if Studio is holding the camera.
+inspection: drag a box around where the brick sits at the inspection spot,
+with a margin for the tilted and rolled holds. wrist: a box around the brick
+between the jaw tips during the hover. Enter accepts, c cancels. Get full
+frames first with `anomaly/extract.py --no-crop` if Studio holds the cameras.
 """
 import argparse
 import re
@@ -18,10 +19,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-def live_frame(cfg) -> "cv2.Mat":
+def live_frame(cfg, camera: str) -> "cv2.Mat":
     from cell.hardware import build_cameras
 
-    cam = build_cameras({**cfg, "studio": {**cfg["studio"], "cameras": [cfg["inspection"]["camera"]]}})
+    cam = build_cameras({**cfg, "studio": {**cfg["studio"], "cameras": [camera]}})
     cam = next(iter(cam.values()))
     cam.connect()
     try:
@@ -32,36 +33,54 @@ def live_frame(cfg) -> "cv2.Mat":
         cam.disconnect()
 
 
-def write_roi(config: Path, roi: list[int]):
-    text = config.read_text()
-    new, n = re.subn(r"(?m)^(\s*roi:)\s*[^#\n]*?(\s*#.*)?$", lambda m: f"{m.group(1)} {roi}{m.group(2) or ''}", text, count=1)
-    if n != 1:
-        raise SystemExit(f"no 'roi:' line in {config}")
-    config.write_text(new)
+def write_roi(config: Path, view: str, roi: list[int]):
+    """Replace the roi: line inside inspection.views.<view>, keeping comments and layout."""
+    lines = config.read_text().splitlines(keepends=True)
+    path = ["inspection", "views", view]
+    depth, indent = 0, -1
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        ind = len(line) - len(stripped)
+        if depth == len(path):
+            if ind <= indent:
+                break  # left the view's block without finding roi
+            if stripped.startswith("roi:"):
+                comment = re.search(r"\s+#.*$", line.rstrip("\n"))
+                lines[i] = f"{line[:ind]}roi: {roi}{comment.group(0) if comment else ''}\n"
+                config.write_text("".join(lines))
+                return
+        elif ind > indent and stripped.split(":")[0] == path[depth]:
+            depth, indent = depth + 1, ind
+    raise SystemExit(f"no inspection.views.{view}.roi line in {config}")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image", nargs="?")
-    ap.add_argument("--camera", action="store_true")
+    ap.add_argument("--camera", action="store_true", help="grab a live frame from the view's camera")
+    ap.add_argument("--view", default="inspection", help="inspection or wrist (inspection.views in station.yaml)")
     ap.add_argument("--config", default="station.yaml", type=Path)
     args = ap.parse_args()
     cfg = yaml.safe_load(args.config.read_text())
+    if args.view not in cfg["inspection"]["views"]:
+        raise SystemExit(f"no view {args.view!r}; have {list(cfg['inspection']['views'])}")
     if args.camera:
-        img = live_frame(cfg)
+        img = live_frame(cfg, cfg["inspection"]["views"][args.view]["camera"])
     elif args.image:
         img = cv2.imread(args.image)
         if img is None:
             raise SystemExit(f"cannot read {args.image}")
     else:
         raise SystemExit("give an image path or --camera")
-    x, y, w, h = cv2.selectROI("inspection ROI (Enter to accept)", img, showCrosshair=True)
+    x, y, w, h = cv2.selectROI(f"{args.view} ROI (Enter to accept)", img, showCrosshair=True)
     cv2.destroyAllWindows()
     if w == 0 or h == 0:
         raise SystemExit("no box selected")
     roi = [int(x), int(y), int(w), int(h)]
-    write_roi(args.config, roi)
-    print(f"inspection.roi = {roi} written to {args.config}")
+    write_roi(args.config, args.view, roi)
+    print(f"inspection.views.{args.view}.roi = {roi} written to {args.config}")
 
 
 if __name__ == "__main__":

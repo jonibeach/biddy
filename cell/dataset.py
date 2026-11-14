@@ -94,9 +94,9 @@ class Dataset:
         return np.ascontiguousarray(img)
 
 
-def joint_speed(state: np.ndarray, fps: float) -> np.ndarray:
-    """(T,) largest body-joint speed in units/s, lightly smoothed."""
-    body = state[:, :5]
+def joint_speed(state: np.ndarray, fps: float, gripper: bool = False) -> np.ndarray:
+    """(T,) largest joint speed in units/s, lightly smoothed; gripper excluded unless asked."""
+    body = state if gripper else state[:, :5]
     speed = np.zeros(len(state), np.float32)
     if len(state) > 1:
         speed[1:] = np.abs(np.diff(body, axis=0)).max(axis=1) * fps
@@ -106,9 +106,14 @@ def joint_speed(state: np.ndarray, fps: float) -> np.ndarray:
     return np.convolve(speed, np.ones(n) / n, mode="same").astype(np.float32)
 
 
-def still_runs(state: np.ndarray, fps: float, still_speed: float, min_s: float = 0.3) -> list[tuple[int, int]]:
-    """[start, end) frame ranges where the arm stays nearly still for at least min_s."""
-    still = joint_speed(state, fps) <= still_speed
+def still_runs(state: np.ndarray, fps: float, still_speed: float, min_s: float = 0.3,
+               gripper: bool = False) -> list[tuple[int, int]]:
+    """[start, end) frame ranges where the arm stays nearly still for at least min_s.
+
+    gripper=True also requires the gripper to be still, so a hold does not run
+    on into a grasp (the jaws closing change what the wrist camera sees).
+    """
+    still = joint_speed(state, fps, gripper) <= still_speed
     runs, start = [], None
     for i, s in enumerate(np.append(still, False)):
         if s and start is None:
@@ -119,21 +124,3 @@ def still_runs(state: np.ndarray, fps: float, still_speed: float, min_s: float =
             start = None
     return runs
 
-
-def inspection_frames(ep: Episode, inspect_pose: np.ndarray | None, tolerance: float, still_speed: float) -> np.ndarray:
-    """Frame indices (within the episode) where the brick is held at the inspection camera.
-
-    With a recorded inspect pose: still frames within `tolerance` of it. Without
-    one: the longest still stretch in the middle of the episode (after the
-    pick, before the drop), which is where demonstrations pause to inspect.
-    """
-    speed = joint_speed(ep.state, ep.fps)
-    if inspect_pose is not None:
-        near = np.abs(ep.state[:, :5] - inspect_pose[:5]).max(axis=1) <= tolerance
-        return np.flatnonzero(near & (speed <= still_speed))
-    T = len(ep.state)
-    runs = [(a, b) for a, b in still_runs(ep.state, ep.fps, still_speed) if a > 0.2 * T and b < 0.9 * T]
-    if not runs:
-        return np.array([], int)
-    a, b = max(runs, key=lambda r: r[1] - r[0])
-    return np.arange(a, b)

@@ -2,13 +2,16 @@
 
 Data layout (what anomaly/capture.py writes):
 
-    data/anomaly/good/*.png        bricks without marks, the more the better
-    data/anomaly/defective/*.png   marked bricks; only used to test and pick the threshold
+    data/anomaly/<view>/good/*.png        crops from good-brick demos, the more the better
+    data/anomaly/<view>/defective/*.png   crops from defective-brick demos; only used to
+                                          test and pick the threshold (per episode)
+
+Train one model per camera view (./biddy train-anomaly does all views).
 
 Run with the anomaly/ venv, which has PyTorch's Intel GPU (XPU) build:
 
     uv sync --project anomaly
-    anomaly/.venv/bin/python anomaly/train.py --data data/anomaly --out models/anomaly
+    anomaly/.venv/bin/python anomaly/train.py --data data/anomaly/inspection --out models/inspection
 
 Writes <out>/model.xml + model.bin (OpenVINO, fixed [1, 3, S, S] input, FP16
 weights), <out>/meta.json, and a score report on the held-out images. With
@@ -58,6 +61,25 @@ def score_images(model_dir: Path, images: list[tuple[str, int]], device: str = "
         rgb = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
         scores.append((path, label, m(rgb).score))
     return scores
+
+
+def by_episode(scores) -> list[tuple[str, int, float]]:
+    """Collapse crop scores to one per recorded episode: its worst (highest) crop.
+
+    A defective brick has its mark on one face, so only its worst crop is
+    expected to score high; that is also how the cell decides live. Crops
+    from anomaly/extract.py carry the episode in their name (…_ep0004_h2_…);
+    other files count as their own episode.
+    """
+    import re
+
+    episodes: dict[str, tuple[int, float]] = {}
+    for path, label, s in scores:
+        m = re.search(r"^(.*_ep\d+)_", Path(path).name)
+        key = f"{label}:{m.group(1)}" if m else path
+        prev = episodes.get(key)
+        episodes[key] = (label, max(s, prev[1]) if prev else s)
+    return [(key.split(":", 1)[-1], label, s) for key, (label, s) in episodes.items()]
 
 
 def pick_threshold(scores) -> tuple[float, str]:
@@ -176,7 +198,7 @@ def main():
                 shutil.copy(exported.with_suffix(suffix), out / f"model{suffix}")
         else:
             quantize_int8(exported, sorted(good_dir.glob("*.png")), args.size, out / "model.xml")
-        scores = score_images(out, images)
+        scores = by_episode(score_images(out, images))
         threshold, note = pick_threshold(scores)
         meta = {
             "model": args.model,
@@ -192,6 +214,7 @@ def main():
         for path, label, s in sorted(scores, key=lambda r: r[2]):
             wrong = (s >= threshold) != bool(label)
             print(f"  {s:.3f}  {'defective' if label else 'good':9}  {Path(path).name}{'  <-- WRONG' if wrong else ''}")
+        print("  (one row per episode: its worst crop)")
 
 
 if __name__ == "__main__":

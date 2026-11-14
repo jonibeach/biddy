@@ -52,8 +52,13 @@ case "$cmd" in
   extract) need_studio_py; "$STUDIO_PY" anomaly/extract.py --config "$CONFIG" "$@" ;;
   train-anomaly)
     need_anomaly_py
-    out="$(cfg "c['inspection']['model']")"; out="${out%-int8}"
-    "$ANOMALY_PY" anomaly/train.py --data data/anomaly --out "$out" --int8 "$@"
+    # One model per camera view (inspection.views), from data/anomaly/<view>.
+    for view in $(cfg "' '.join(c['inspection']['views'])"); do
+      if [ ! -d "data/anomaly/$view/good" ]; then echo "skip $view: no data/anomaly/$view/good"; continue; fi
+      out="$(cfg "c['inspection']['views']['$view']['model']")"; out="${out%-int8}"
+      echo "=== $view -> $out"
+      "$ANOMALY_PY" anomaly/train.py --data "data/anomaly/$view" --out "$out" --int8 "$@"
+    done
     ;;
   anomaly)
     need_studio_py; need_anomaly_py; dataset_only "$@"
@@ -65,7 +70,7 @@ case "$cmd" in
   bench)   need_studio_py; "$STUDIO_PY" -m cell.bench --config "$CONFIG" "$@" ;;
   mock)
     need_studio_py
-    imgs=(); [ -d data/anomaly ] && imgs=(--mock-images data/anomaly)
+    imgs=(); [ -d data/anomaly/inspection ] && imgs=(--mock-images data/anomaly)
     "$STUDIO_PY" -m cell.run --config "$CONFIG" --mock "${imgs[@]}" "$@"
     ;;
   run)     need_studio_py; "$STUDIO_PY" -m cell.run --config "$CONFIG" "$@" ;;

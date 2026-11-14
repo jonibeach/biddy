@@ -19,7 +19,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cell import poses as poses_mod  # noqa: E402
-from cell.dataset import Dataset, inspection_frames, resolve  # noqa: E402
+from cell.dataset import Dataset, resolve  # noqa: E402
+from cell.inspection import INSPECTION, WRIST, find_holds, view_crop  # noqa: E402
 
 
 def main():
@@ -40,18 +41,23 @@ def main():
     if want != have:
         print(f"CAMERAS DIFFER from station.yaml: missing {sorted(want - have)}, extra {sorted(have - want)}\n")
 
-    inspect_pose = poses_mod.load(cfg["poses"]).get("inspect")
+    home = poses_mod.load(cfg["poses"]).get("home")
     insp = cfg["inspection"]
+    view = insp["views"][INSPECTION]
+    expected = int(cfg.get("scripted", {}).get("after_holds", 4))
     lengths = np.array([e.seconds for e in eps])
     med = float(np.median(lengths)) if len(eps) else 0.0
     flagged = []
-    print(f"{'ep':>4} {'sec':>6} {'grip':>11} {'jump':>5} {'insp':>5}  task / flags")
+    print(f"{'ep':>4} {'sec':>6} {'grip':>11} {'jump':>5} {'holds':>6}  task / flags")
     for e in eps:
         flags = []
         g = e.state[:, 5]
         grip_range = float(g.max() - g.min())
         jump = float(np.abs(np.diff(e.action, axis=0)).max()) if len(e.action) > 1 else 0.0
-        n_insp = len(inspection_frames(e, inspect_pose, insp["pose_tolerance"], insp["still_speed"]))
+        holds = find_holds(e.state, e.fps, lambda i, e=e: view_crop(ds.frame(int(e.global_index[i]), view["camera"]), view),
+                           insp, home)
+        n_insp = sum(h.kind == INSPECTION for h in holds)
+        n_wrist = sum(h.kind == WRIST for h in holds)
         if e.seconds < 0.5 * med:
             flags.append("short")
         if e.seconds > 2.0 * med:
@@ -60,13 +66,15 @@ def main():
             flags.append("gripper barely moves")
         if jump > args.jump:
             flags.append(f"action jump {jump:.0f}")
-        if n_insp == 0:
-            flags.append("no pause at inspection")
+        if n_insp < expected:
+            flags.append(f"{n_insp} inspection holds, protocol has {expected}")
+        if n_wrist == 0:
+            flags.append("no hover hold before the grasp")
         if "|" in e.task:
             flags.append("several tasks in one episode")
         if flags:
             flagged.append(e.index)
-        print(f"{e.index:>4} {e.seconds:>6.1f} {g.min():>5.0f}-{g.max():<5.0f} {jump:>5.0f} {n_insp:>5}  "
+        print(f"{e.index:>4} {e.seconds:>6.1f} {g.min():>5.0f}-{g.max():<5.0f} {jump:>5.0f} {n_wrist:>2}+{n_insp:<3}  "
               f"{e.task}{'  <-- ' + ', '.join(flags) if flags else ''}")
 
     print("\ntasks:")
@@ -85,8 +93,7 @@ def main():
                 print(f"note: {name} barely moves in the demos (std {std:.2f}); the policy may give NaN in FP16 "
                       "on the GPU. The cell falls back to FP32 automatically (policy.precision: auto).")
     print(f"\nlength median {med:.1f}s; flagged {len(flagged)}: {flagged}")
-    if inspect_pose is None:
-        print("(no inspect pose in poses.json; 'insp' uses the longest mid-episode pause)")
+    print("(holds: wrist hover + inspection holds; set inspection.views.inspection.roi for reliable detection)")
 
 
 if __name__ == "__main__":
