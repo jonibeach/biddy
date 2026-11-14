@@ -100,8 +100,10 @@ def joint_speed(state: np.ndarray, fps: float) -> np.ndarray:
     speed = np.zeros(len(state), np.float32)
     if len(state) > 1:
         speed[1:] = np.abs(np.diff(body, axis=0)).max(axis=1) * fps
-    k = np.ones(5) / 5
-    return np.convolve(speed, k, mode="same").astype(np.float32)
+    n = min(5, len(speed))  # a longer kernel than the input changes the output length
+    if n <= 1:
+        return speed
+    return np.convolve(speed, np.ones(n) / n, mode="same").astype(np.float32)
 
 
 def still_runs(state: np.ndarray, fps: float, still_speed: float, min_s: float = 0.3) -> list[tuple[int, int]]:
