@@ -50,18 +50,22 @@ inspection:
   views:
     side:            # centre of the inspection image; set from the demos with scripts/find_spots.py
       camera: inspection
-      roi: [280, 160, 360, 270]
+      crop: brick    # square around the brick found inside roi (cell/brickcrop.py); roi is the search box
+      roi: [100, 100, 540, 380]
       model: models/side-int8
       poses:         # arm poses (5 body joints) at which demos show this spot
         - [-23.0, -98.4, 98.0, 6.8, -0.7]
         - [5.2, -98.5, 98.0, 4.3, 2.3]
     bottom:          # bottom of the inspection image, brick tilted to show its tubes
       camera: inspection
-      roi: [260, 280, 240, 200]
+      crop: brick
+      roi: [60, 220, 580, 260]   # wide: good demos show the bottom at the lower right, defective ones at the lower left
       model: models/bottom-int8
       poses:
         - [2.2, -17.6, -24.5, 98.4, -1.4]
         - [9.0, -30.0, -10.0, 90.0, 3.0]
+        - [6.1, -22.0, -3.9, 73.5, 3.8]     # shallower tilt used in the defective demos
+        - [8.7, -8.4, -19.9, 79.4, 7.5]
     wrist:           # brick between the jaw tips
       camera: wrist
       roi: [200, 60, 240, 240]
@@ -78,10 +82,34 @@ inspection:
   presence_diff: 12.0
   frames: 3                # frames scored per hold; the median counts
   holds_per_brick: 4       # inspection holds per demo: back, bottom, side, side
+  # Brick types by shape, never colour: the elongation (long / short side of
+  # the brick's rotated box) at shape_view. Each type has its own route
+  # (holds) and, later, its own anomaly models. Set long.min_elongation from
+  # the "shape" column of ./biddy check once a few long-brick demos exist.
+  shape_view: side
+  brick_types:
+    standard: {holds: 4}                       # 2x2 Duplo: 90 degree regrasp
+    long: {min_elongation: null, holds: 4}     # held by one end, regrasped at the other
   # A brick whose run ends with no inspection hold was not grasped: pick again.
   max_regrasps: 2
   # Verdicts this close to a threshold are logged as uncertain.
   uncertain_margin: 0.05
+
+# AprilTags (calibration/, cell/tags.py): compared with calibration/reference_<camera>.json
+# with the arm at home before every brick. ./biddy run --no-tags skips it.
+tags:
+  enabled: true
+  cameras: [top, inspection]
+  # A camera listed here may move: its inspection crop boxes move with the
+  # tags, up to max_correction_px.
+  correct: [inspection]
+  tolerance_px: 5.0        # a tag further than this from its reference has moved (jitter is up to 3 px)
+  tolerances:              # per object (calibration/make_tags.py); falling bricks nudge the bowls
+    good_bowl: 15.0
+    defective_bowl: 15.0
+  max_correction_px: 40.0
+  frames: 5                # frames per check; the median position counts
+  on_moved: pause          # pause: wait until it is put back; warn: log it and carry on
 
 scripted:
   speed: 80.0              # units/s for scripted moves

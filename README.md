@@ -81,6 +81,22 @@ after `inspection.holds_per_brick` holds and the arm replays the bowl pose (or
 the drop policy takes over). Every policy action is checked before it reaches
 the arm: NaN ends the run, everything else is clamped to the joint range.
 
+## AprilTag check
+
+With the arm at home before every brick, the cell compares the AprilTags in
+the top and inspection images with `calibration/reference_<camera>.json`
+(`station.yaml` `tags`, `cell/tags.py`; about 0.25 s per brick).
+
+- A bowl, the arm base, the stand or the top camera moved: the cell prints
+  what moved and waits until it is back (`on_moved: pause`), or only logs it
+  (`warn`). Time spent waiting is not counted as cycle time.
+- The inspection camera moved: its crop boxes move with the tags, so the
+  Anomalib models still see the brick where they were trained to. The frame
+  is not warped: the crop boxes reach the image edge, and a warped frame has
+  made-up pixels there that score as defects.
+- Tags that are covered are ignored. `cycles.csv` logs `tag_shift` and
+  `tag_note` per brick. `./biddy run --no-tags` switches it all off.
+
 ## Layout
 
 | Path | What |
@@ -93,6 +109,7 @@ the arm: NaN ends the run, everything else is clamped to the joint range.
 | `cell/poses.py` | record poses by hand, smooth scripted moves |
 | `cell/anomaly.py` | OpenVINO anomaly scoring |
 | `cell/inspection.py` | hold detection and the worst-face verdict |
+| `cell/tags.py` | AprilTag check before every brick; inspection crops follow the tags |
 | `scripts/find_spots.py` | find the arm poses of the inspection spots in the demos |
 | `cell/bench.py` | latency of every model on CPU/GPU/NPU |
 | `cell/train_policy.py` | train a policy through Studio's API |

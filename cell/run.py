@@ -48,9 +48,10 @@ import yaml
 
 from cell import poses as poses_mod
 from cell import studio
+from cell import tags as tags_mod
 from cell.anomaly import AnomalyModel, overlay
 from cell.anomaly import Verdict as Score
-from cell.inspection import Verdict, hold_kind, near, presence, split_views, view_crop
+from cell.inspection import Verdict, hold_kind, near, presence, score_crop, split_views, view_crop
 
 # --- inspector: scores holds in the background --------------------------------
 
@@ -66,17 +67,25 @@ class Inspector(threading.Thread):
 
     def __init__(self, models: dict[str, AnomalyModel], views: dict, cfg: dict, on_defective):
         super().__init__(daemon=True)
-        self.models, self.views, self.cfg, self.on_defective = models, views, cfg, on_defective
+        self.models, self.station_views, self.cfg, self.on_defective = models, views, cfg, on_defective
         self.insp_views, self.hover_view = split_views(views)
         self.q: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
         self.reset(None, None)
         self.start()
 
-    def reset(self, home: np.ndarray | None, backgrounds: dict[str, np.ndarray] | None):
-        """New brick: home pose and the empty crop of every inspection view."""
+    def reset(self, home: np.ndarray | None, backgrounds: dict[str, np.ndarray] | None, views: dict | None = None,
+              empty_frames: dict[str, np.ndarray] | None = None):
+        """New brick: home pose and the empty crop of every inspection view.
+
+        views: this brick's views when a camera moved and its crop boxes
+        follow the AprilTags (cell/tags.py); default: the station's.
+        empty_frames: each camera's full frame with the arm at home, which
+        `crop: brick` views compare against to find the brick (cell/brickcrop.py).
+        """
         with self.lock:
-            self.home, self.backgrounds = home, backgrounds
+            self.home, self.backgrounds, self.views = home, backgrounds, views or self.station_views
+            self.empty_frames = empty_frames or {}
             self.verdict = Verdict({v: m.threshold for v, m in self.models.items()}, self.hover_view)
             self.kinds: dict[int, str | None] = {}
             self.samples: dict[int, list[tuple[float, np.ndarray]]] = {}
@@ -119,7 +128,10 @@ class Inspector(threading.Thread):
             kind = self.kinds[hold_id]
             if kind is None:
                 return
-            rgb = view_crop(frames[self.views[kind]["camera"]], self.views[kind])
+            cam = self.views[kind]["camera"]
+            rgb = score_crop(frames[cam], self.views[kind], self.empty_frames.get(cam))
+            if rgb is None:  # crop: brick found no brick in this frame
+                return
         result = self.models[kind](rgb)
         with self.lock:
             self.infer_ms.append(result.latency_ms)
@@ -182,6 +194,7 @@ class Watcher:
         self.state: np.ndarray | None = None
         self.home_still = 0
         self.left_home = False
+        self.motion: list[tuple] = []  # (t, state, action_sent, loop_s, sleep_s, stale) per tick
 
     def on_action_ready(self, *, action, step):
         """Last check before a policy action reaches the arm.
@@ -196,6 +209,9 @@ class Watcher:
 
     def on_tick(self, event):
         state = np.asarray(event.robot_state.joint_positions, np.float32)
+        sent = event.action_sent
+        self.motion.append((time.monotonic(), state.copy(), None if sent is None else np.asarray(sent, np.float32).copy(),
+                            float(event.loop_duration_s), float(event.sleep_time_s), bool(event.stale_obs)))
         now = time.monotonic()
         speed = 0.0
         if self.prev is not None and now > self.prev[0]:
@@ -265,6 +281,8 @@ class Cycle:
     home_s: float = 0.0
     total_s: float = 0.0
     crop: str = ""
+    tag_shift: float = 0.0       # px a camera moved whose inspection crops followed the AprilTags
+    tag_note: str = ""           # what the AprilTag check found (cell/tags.py)
     note: str = field(default="")
 
 
@@ -362,11 +380,13 @@ class KeepOpen:
 
 class Cell:
     def __init__(self, cfg: dict, arm, cameras: dict, model, anomaly: dict[str, AnomalyModel], poses: dict,
-                 log: RunLog, show: bool = False, drop_model=None):
+                 log: RunLog, show: bool = False, drop_model=None, guard: tags_mod.TagGuard | None = None):
         from physicalai.runtime import AsyncExecution, PolicySource, RobotRuntime, SyncExecution
 
         self.cfg, self.arm, self.cameras, self.poses, self.log = cfg, arm, cameras, poses, log
+        self.guard = guard
         self.pcfg, self.icfg = cfg["policy"], cfg["inspection"]
+        self.views = self.icfg["views"]  # this brick's views: crop boxes follow the tags when a camera moved
         self.show = show
         self.mode = "handover" if drop_model is not None else self.pcfg["drop"]
         needed = ["home"] + (["good_bowl", "defective_bowl"] if self.mode == "scripted" else [])
@@ -388,9 +408,17 @@ class Cell:
         self.source = SwitchSource({"pick": pick_source,
                                     "drop": source(drop_model) if drop_model is not None else pick_source})
         self.inspector = Inspector(anomaly, self.icfg["views"], self.icfg, self._on_defective)
-        self.watcher = Watcher(self.inspector, self.icfg, float(self.pcfg["fps"]))
+        from physicalai.runtime import LinearInterpolator
+
+        # The SO-101 ignores goal_time and jumps to each target, so 30 Hz policy
+        # actions make a staircase (jitter). Split every action into `interpolate`
+        # linearly interpolated commands (3 -> 90 Hz), as Studio's own robot loop does.
+        self.interpolate = int(self.pcfg.get("interpolate", 3))
+        tick_hz = float(self.pcfg["fps"]) * self.interpolate
+        self.watcher = Watcher(self.inspector, self.icfg, tick_hz)
         self.runtime = RobotRuntime(robot=arm, action_source=self.source, fps=float(self.pcfg["fps"]),
-                                    cameras=cameras, callbacks=[self.watcher])
+                                    cameras=cameras, callbacks=[self.watcher],
+                                    interpolator=LinearInterpolator(multiplier=self.interpolate))
         self.watcher.stop = self.runtime.stop
         self.insp_cam = cameras[self.icfg["views"][self.insp_views[0]]["camera"]]
         self.stop_event = threading.Event()
@@ -406,11 +434,36 @@ class Cell:
         self.watcher.begin(end, self.poses["home"], holds)
         t0 = time.monotonic()
         self.runtime.run(duration_s=timeout, stop_event=self.stop_event)
+        self._save_motion(phase)
         # run() swallows Ctrl+C and returns; don't let that look like a timeout.
         if self.runtime.last_run_reason in ("interrupted", "error") or self.stop_event.is_set():
             self.stop_event.set()
             raise StopCell(f"policy run ended: {self.runtime.last_run_reason}")
         return self.watcher.done, time.monotonic() - t0
+
+    def _save_motion(self, phase: str):
+        """runs/<time>/motion_<brick>_<phase>.csv: what the arm did and was told, per tick,
+        plus a one-line timing check (late ticks mean the laptop is too busy for smooth control)."""
+        rows = self.watcher.motion
+        if not rows:
+            return
+        brick = len(self.log.rows) + 1
+        path = self.log.dir / f"motion_{brick:04d}_{phase}.csv"
+        names = ["pan", "lift", "elbow", "wflex", "wroll", "grip"]
+        t0 = rows[0][0]
+        with path.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t", *[f"state_{n}" for n in names], *[f"cmd_{n}" for n in names], "loop_s", "sleep_s", "stale"])
+            for t, st, cmd, loop_s, sleep_s, stale in rows:
+                cmd_vals = [""] * 6 if cmd is None else [round(float(x), 3) for x in cmd]
+                w.writerow([round(t - t0, 4), *[round(float(x), 3) for x in st], *cmd_vals,
+                            round(loop_s, 5), round(sleep_s, 5), int(stale)])
+        late = sum(1 for r in rows if r[4] < 0)
+        grip_cmd = [r[2][5] for r in rows if r[2] is not None]
+        grip = [r[1][5] for r in rows]
+        print(f"  motion: {len(rows)} ticks in {rows[-1][0] - t0:.1f}s, {late} late ({100 * late / len(rows):.0f}%), "
+              f"gripper commanded {min(grip_cmd, default=float('nan')):.1f}-{max(grip_cmd, default=float('nan')):.1f}, "
+              f"measured {min(grip):.1f}-{max(grip):.1f} -> {path.name}")
 
     def _move(self, pose: np.ndarray, gripper: float | None = None) -> float:
         """Scripted move; raises StopCell if it is stopped or does not arrive."""
@@ -426,17 +479,51 @@ class Cell:
         if not self.show:
             return
         img = overlay(rgb, Score(score, verdict == "defective", 0.0))
-        cv2.imshow("worst face", img)
-        cv2.waitKey(1)
+        try:
+            cv2.imshow("worst face", img)
+            cv2.waitKey(1)
+        except cv2.error:
+            # Studio's venv has a headless OpenCV (no windows): keep the latest preview as a file instead.
+            path = self.log.dir / "preview.png"
+            cv2.imwrite(str(path), img)
+            if not getattr(self, "_preview_note", False):
+                print(f"(no display support in OpenCV; --show writes {path} instead)")
+                self._preview_note = True
+
+    def _check_tags(self, c: Cycle) -> float:
+        """Arm at home: compare the AprilTags with their references (cell/tags.py).
+
+        Sets this brick's crop boxes. With tags.on_moved: pause, waits until
+        everything that moved is back. Returns the seconds spent waiting.
+        """
+        self.views = self.icfg["views"]
+        if self.guard is None:
+            return 0.0
+        waiting_since = None
+        while True:
+            report = self.guard.check(self.cameras)
+            if not report.problems or self.guard.on_moved != "pause":
+                break
+            if waiting_since is None:
+                waiting_since = time.monotonic()
+                print(f"brick {c.cycle}: WAITING: {'; '.join(report.problems)}. Put it back (Ctrl+C stops).")
+            if self.stop_event.wait(1.0):
+                raise StopCell("stopped while waiting for a moved tag")
+        waited = time.monotonic() - waiting_since if waiting_since is not None else 0.0
+        self.views, c.tag_shift = tags_mod.follow(self.icfg["views"], report.matrices), report.shift
+        notes = report.problems + report.notes + ([f"waited {waited:.0f}s for a moved tag"] if waited else [])
+        c.tag_note = "; ".join(notes)
+        return waited
 
     # one brick
 
     def cycle(self, i: int) -> Cycle:
         c = Cycle(i, started=datetime.now().isoformat(timespec="seconds"))
         t_start = time.monotonic()
+        t_start += self._check_tags(c)  # time spent waiting for a person is not cycle time
         if hasattr(self.insp_cam, "next_brick"):  # mock: put the next brick on the table
             c.truth = self.insp_cam.next_brick()
-        views = self.icfg["views"]
+        views = self.views
         timeout = float(self.pcfg["episode_timeout_s"])
         holds_wanted = int(self.icfg.get("holds_per_brick", 4))
 
@@ -445,7 +532,7 @@ class Cell:
             # Arm at home: the inspection view is empty; that is the presence reference.
             frames = {cam: self.cameras[cam].read().data for cam in {views[v]["camera"] for v in self.insp_views}}
             self.inspector.reset(self.poses["home"], {v: view_crop(frames[views[v]["camera"]], views[v])
-                                                      for v in self.insp_views})
+                                                      for v in self.insp_views}, views, frames)
             if self.mode == "task_switch":
                 done, c.episode_s = self._policy("pick", self.pick_task, timeout, "home")
             else:
@@ -528,7 +615,8 @@ class Cell:
                 print(f"brick {i}: {c.outcome:9} {c.verdict or '-':9} worst {c.worst_view or '-'} {c.score:.3f}"
                       f"/{c.threshold:.3f}{' UNCERTAIN' if c.uncertain else ''} holds {c.hover_holds}+{c.holds} "
                       f"regrasps {c.regrasps} {c.total_s:.1f}s"
-                      + (f" (truth {c.truth})" if c.truth else "") + (f"  {c.note}" if c.note else ""))
+                      + (f" (truth {c.truth})" if c.truth else "") + (f"  {c.note}" if c.note else "")
+                      + (f"  tags: {c.tag_note}" if c.tag_note else ""))
 
 
 # --- setup -------------------------------------------------------------------
@@ -613,6 +701,7 @@ def build_mock(cfg: dict, poses: dict, miss_every: int):
     for name, v in views.items():
         if name in mock_views:
             v.update(mock_views[name])
+            v.pop("crop", None)  # the mock draws red bricks, which the brick finder treats as gripper
     cams = {name: MockCamera(name) for name in cfg["studio"]["cameras"]}
     station = MockStation(arm, poses, views, miss_every=miss_every)
     for view in views:
@@ -631,6 +720,7 @@ def main():
     ap.add_argument("--mock", action="store_true", help="no hardware: mock arm, cameras and policy")
     ap.add_argument("--mock-miss-every", type=int, default=0, help="mock: every n-th pick grabs nothing")
     ap.add_argument("--mock-policy", help="mock: drive the mock arm with this exported policy instead of the scripted one")
+    ap.add_argument("--no-tags", action="store_true", help="skip the AprilTag check and the crops that follow the tags (station.yaml tags)")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -653,9 +743,14 @@ def main():
     else:
         arm, cameras, model, drop_model = build_real(cfg)
     anomaly = load_anomaly(cfg)
+    # The mock cameras show no tags, so the check is for the real station only.
+    guard = None if args.mock or args.no_tags else tags_mod.TagGuard.from_config(cfg.get("tags"))
+    if guard is not None:
+        print(f"tags: checking {', '.join(guard.cameras)} before every brick ({guard.on_moved} when one moved)"
+              + (f"; {', '.join(sorted(guard.correct))} crops follow the tags" if guard.correct else ""))
 
     log = RunLog(cfg["runs_dir"], cfg)
-    cell = Cell(cfg, arm, cameras, model, anomaly, poses, log, show=args.show, drop_model=drop_model)
+    cell = Cell(cfg, arm, cameras, model, anomaly, poses, log, show=args.show, drop_model=drop_model, guard=guard)
     try:
         cell.run(args.cycles)
     except KeyboardInterrupt:
