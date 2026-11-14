@@ -167,6 +167,28 @@ class RunLog:
 # --- the cell ----------------------------------------------------------------
 
 
+class StopCell(Exception):
+    """Stop the cell now: Ctrl+C, or a move that did not get where it had to."""
+
+
+class KeepOpen:
+    """Passes everything to the inference model except close().
+
+    RobotRuntime closes its policy at the end of every run(), but the cell runs
+    the same policy many times (pick, drop, every cycle). The cell closes the
+    real model itself when it exits.
+    """
+
+    def __init__(self, model):
+        self._model = model
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+    def close(self):
+        pass
+
+
 class Cell:
     def __init__(self, cfg: dict, arm, cameras: dict, model, anomaly: AnomalyModel, poses: dict, log: RunLog,
                  show: bool = False):
@@ -180,7 +202,8 @@ class Cell:
         if missing:
             raise SystemExit(f"poses missing from {cfg['poses']}: {missing}; record them with python -m cell.poses record")
         execution = AsyncExecution() if self.pcfg.get("mode") == "async" else SyncExecution()
-        self.source = PolicySource(model, execution, task=self.pcfg["tasks"]["good"])
+        self.model = model
+        self.source = PolicySource(KeepOpen(model), execution, task=self.pcfg["tasks"]["good"])
         self.watcher = Watcher(poses["inspect"], self.icfg["pose_tolerance"], self.icfg["still_speed"],
                                release_delta=float(self.pcfg.get("release_delta", 20.0)))
         self.runtime = RobotRuntime(robot=arm, action_source=self.source, fps=float(self.pcfg["fps"]),
@@ -207,11 +230,20 @@ class Cell:
         self.watcher.begin(phase, grip_ref)
         t0 = time.monotonic()
         self.runtime.run(duration_s=timeout, stop_event=self.stop_event)
+        # run() swallows Ctrl+C and returns; don't let that look like a timeout.
+        if self.runtime.last_run_reason in ("interrupted", "error") or self.stop_event.is_set():
+            self.stop_event.set()
+            raise StopCell(f"policy run ended: {self.runtime.last_run_reason}")
         return self.watcher.done, time.monotonic() - t0
 
     def _move(self, pose: np.ndarray, gripper: float | None = None) -> float:
+        """Scripted move; raises StopCell if it is stopped or does not arrive."""
         t0 = time.monotonic()
-        poses_mod.move_to(self.arm, pose, speed=float(self.cfg["scripted"]["speed"]), gripper=gripper, stop=self.stop_event)
+        ok = poses_mod.move_to(self.arm, pose, speed=float(self.cfg["scripted"]["speed"]), gripper=gripper,
+                               stop=self.stop_event)
+        if not ok:
+            raise StopCell("stopped" if self.stop_event.is_set() else
+                           f"arm did not reach {np.round(pose, 1).tolist()}; check for a collision or a stuck joint")
         return time.monotonic() - t0
 
     def _preview(self, rgb: np.ndarray, v: Verdict | None):
@@ -235,9 +267,6 @@ class Cell:
         for attempt in range(int(self.icfg.get("max_regrasps", 0)) + 1):
             c.regrasps = attempt
             reached, c.pick_s = self._policy("pick", self.pcfg["tasks"]["good"], float(self.pcfg["pick_timeout_s"]))
-            if self.stop_event.is_set():
-                c.outcome = "stopped"
-                return c
             if not reached:
                 c.outcome, c.note = "pick_timeout", f"no inspect pose after {c.pick_s:.0f}s"
                 c.home_s = self._move(self.poses["home"])
@@ -290,10 +319,13 @@ class Cell:
                 i += 1
                 try:
                     c = self.cycle(i)
-                except Exception as e:  # noqa: BLE001 - log, park, and stop on hardware trouble
-                    c = Cycle(i, outcome="error", note=f"{type(e).__name__}: {e}")
-                    self.log.add(c)
-                    print(f"cycle {i}: ERROR {c.note}")
+                except StopCell as e:
+                    self.log.add(Cycle(i, outcome="stopped", note=str(e)))
+                    print(f"cycle {i}: stopped: {e}")
+                    return
+                except Exception as e:
+                    self.log.add(Cycle(i, outcome="error", note=f"{type(e).__name__}: {e}"))
+                    print(f"cycle {i}: ERROR {type(e).__name__}: {e}")
                     raise
                 self.log.add(c)
                 print(f"cycle {i}: {c.outcome:12} {c.verdict or '-':9} score {c.score:.3f} "
@@ -384,6 +416,9 @@ def main():
         cell.stop_event.set()
         print("\nstopped")
     finally:
+        close = getattr(model, "close", None)
+        if close is not None:
+            close()
         print(log.summary())
 
 
