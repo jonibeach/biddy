@@ -1,0 +1,45 @@
+# Station config for the inspection cell (cell/run.py). Robot calibration,
+# serial numbers and camera identities are read from Physical AI Studio's
+# database, so the cell drives exactly what Studio recorded with.
+
+studio:
+  db: ~/.local/share/physicalai/data/physicalai.db
+  follower: SO101 Follower v2      # project_robots.name
+  cameras: [top, wrist, inspection]  # project_cameras.name, same keys the policy was trained on
+
+poses: poses.json  # written by: python -m cell.poses record
+
+policy:
+  # "latest" = newest model Studio trained, or a path to an exports/openvino folder
+  model: latest
+  device: GPU              # OpenVINO device for the policy: CPU, GPU, NPU
+  fps: 30
+  mode: async              # sync waits for each chunk; async infers while the arm moves
+  # Task text per phase. The pick task must match a task in the dataset.
+  tasks:
+    good: put the brick in the good bowl
+    defective: put the brick in the defective bowl
+  # How the brick gets into the bowl after inspection:
+  #   task_switch: keep running the policy, switching its task to the verdict's bowl
+  #   scripted:    stop the policy at the inspection pose and replay recorded bowl poses
+  drop: task_switch
+  pick_timeout_s: 30       # give up reaching the inspection pose after this long
+  drop_timeout_s: 20       # task_switch: stop the policy after this long past inspection
+
+inspection:
+  model: models/anomaly    # anomaly/train.py output; models/anomaly-int8 for the INT8 one
+  device: CPU
+  camera: inspection
+  roi: null                # [x, y, w, h] crop in the 640x480 image; set with anomaly/roi.py
+  # The arm counts as "at inspection" when every body joint is within this many
+  # normalized units (-100..100 scale) of the inspect pose and nearly still.
+  pose_tolerance: 10.0
+  still_speed: 15.0        # max joint speed (units/s) to count as still
+  frames: 3                # score this many frames and use the median
+  # Re-grasp: if the inspection crop looks like no brick (score above this) the
+  # arm goes home and the policy picks again, up to max_regrasps times.
+  empty_score: null
+  max_regrasps: 1
+
+home_after_drop: true
+runs_dir: runs
