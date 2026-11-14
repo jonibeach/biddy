@@ -161,7 +161,24 @@ def find_holds(state: np.ndarray, fps: float, inspection_crops, cfg: dict, hover
 
 
 def view_crop(rgb: np.ndarray, view_cfg: dict) -> np.ndarray:
+    """The view's search box (roi): used for presence, and as the score crop of fixed-box views."""
     return crop(rgb, view_cfg.get("roi"))
+
+
+def score_crop(rgb: np.ndarray, view_cfg: dict, background: np.ndarray | None) -> np.ndarray | None:
+    """The image Anomalib scores for a hold.
+
+    crop: brick  -> a square around the brick found inside roi (cell/brickcrop.py);
+                    needs the camera's full empty frame; None if no brick is found.
+    otherwise    -> the fixed roi box.
+    """
+    if view_cfg.get("crop") == "brick":
+        if background is None:
+            return None
+        from cell.brickcrop import brick_crop
+
+        return brick_crop(rgb, background, view_cfg.get("roi"))
+    return view_crop(rgb, view_cfg)
 
 
 def episode_crops(ds, ep, views: dict, names: list[str]):
@@ -178,3 +195,44 @@ def episode_crops(ds, ep, views: dict, names: list[str]):
         return out
 
     return crops
+
+
+def episode_score_crops(ds, ep, views: dict):
+    """score(view, i) -> score crop of `view` at episode frame i (frame 0 is the empty view)."""
+    backgrounds: dict[str, np.ndarray] = {}
+
+    def score(view: str, i: int) -> np.ndarray | None:
+        cam = views[view]["camera"]
+        if cam not in backgrounds:
+            backgrounds[cam] = ds.frame(int(ep.global_index[0]), cam)
+        return score_crop(ds.frame(int(ep.global_index[i]), cam), views[view], backgrounds[cam])
+
+    return score
+
+
+def brick_type(elong: float | None, types: dict | None) -> str:
+    """Brick type from its elongation at the shape view (station.yaml brick_types).
+
+    The type with the highest min_elongation the brick reaches wins; a type
+    without min_elongation is the default. "?" when the shape is unknown or
+    no thresholds are set yet.
+    """
+    if not types:
+        return "?"
+    default = next((t for t, c in types.items() if (c or {}).get("min_elongation") is None), "?")
+    if elong is None:
+        return "?"
+    reached = [(float(c["min_elongation"]), t) for t, c in types.items()
+               if (c or {}).get("min_elongation") is not None and elong >= float(c["min_elongation"])]
+    return max(reached)[1] if reached else default
+
+
+def episode_elongation(ds, ep, holds: list[Hold], views: dict, shape_view: str, frames: int = 3) -> float | None:
+    """Median brick elongation over the episode's holds at shape_view (frame 0 is the empty view)."""
+    from cell.brickcrop import elongation
+
+    cam = views[shape_view]["camera"]
+    background = ds.frame(int(ep.global_index[0]), cam)
+    vals = [e for h in holds if h.kind == shape_view for i in h.frames(frames)
+            if (e := elongation(ds.frame(int(ep.global_index[int(i)]), cam), background, views[shape_view].get("roi"))) is not None]
+    return float(np.median(vals)) if vals else None

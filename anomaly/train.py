@@ -160,8 +160,14 @@ def stage(data: Path, stage_dir: Path, holdout: float, copies: int) -> tuple[lis
 
 
 def trainer_device(choice: str) -> dict:
-    """Lightning accelerator/strategy for the Intel GPU (XPU), or the CPU."""
+    """Lightning accelerator/strategy for the Intel GPU (XPU), an NVIDIA GPU (cuda), or the CPU."""
     import torch
+
+    if choice == "cuda":  # e.g. a cloud GPU (cloud/modal_anomaly.py)
+        if not torch.cuda.is_available():
+            sys.exit("no CUDA GPU visible to PyTorch; use --accelerator cpu")
+        print(f"training on CUDA GPU: {torch.cuda.get_device_name(0)}")
+        return {"accelerator": "gpu", "devices": 1}
 
     if choice == "xpu":
         if not torch.xpu.is_available():
@@ -207,8 +213,8 @@ def main():
     ap.add_argument("--holdout", type=float, default=0.2, help="fraction of good episodes held out for the threshold")
     ap.add_argument("--augment", type=int, default=1, choices=[0, 1, 3, 7],
                     help="extra rotated/flipped copies of each good crop (bricks in different orientations); 0 = off")
-    ap.add_argument("--accelerator", default="cpu", choices=["cpu", "xpu"],
-                    help="cpu (default) or xpu (Intel GPU; experimental: Patchcore training currently "
+    ap.add_argument("--accelerator", default="cpu", choices=["cpu", "xpu", "cuda"],
+                    help="cpu (default), cuda (NVIDIA GPU, e.g. cloud/modal_anomaly.py) or xpu (Intel GPU; experimental: Patchcore training currently "
                          "triggers an xe driver page fault on this laptop)")
     args = ap.parse_args()
 
