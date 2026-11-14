@@ -27,8 +27,11 @@ policy:
   drop_timeout_s: 20       # task_switch: stop the policy after this long past inspection
 
 inspection:
-  model: models/anomaly    # anomaly/train.py output; models/anomaly-int8 for the INT8 one
-  device: CPU
+  model: models/anomaly-int8  # anomaly/train.py --int8 output (NNCF INT8); models/anomaly for FP
+  # Policy on the GPU, inspection on the NPU, control loop on the CPU: the two
+  # models never compete for the same accelerator. GPU is fastest if the NPU
+  # is busy or missing; `python -m cell.anomaly <model> --bench` compares them.
+  device: NPU
   camera: inspection
   roi: null                # [x, y, w, h] crop in the 640x480 image; set with anomaly/roi.py
   # The arm counts as "at inspection" when every body joint is within this many

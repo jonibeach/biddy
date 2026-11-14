@@ -5,10 +5,10 @@ Data layout (what anomaly/capture.py writes):
     data/anomaly/good/*.png        bricks without marks, the more the better
     data/anomaly/defective/*.png   marked bricks; only used to test and pick the threshold
 
-Run with the repo's own venv (Anomalib is in the `anomaly` dependency group):
+Run with the anomaly/ venv, which has PyTorch's Intel GPU (XPU) build:
 
-    uv sync --group anomaly
-    uv run --group anomaly python anomaly/train.py --data data/anomaly --out models/anomaly
+    uv sync --project anomaly
+    anomaly/.venv/bin/python anomaly/train.py --data data/anomaly --out models/anomaly
 
 Writes <out>/model.xml + model.bin (OpenVINO, fixed [1, 3, S, S] input, FP16
 weights), <out>/meta.json, and a score report on the held-out images. With
@@ -75,6 +75,21 @@ def pick_threshold(scores) -> tuple[float, str]:
     return best, f"scores overlap; {errors}/{len(scores)} held-out images misclassified at {best:.3f}"
 
 
+def trainer_device(choice: str) -> dict:
+    """Lightning accelerator/strategy for the Intel GPU (XPU), or the CPU."""
+    import torch
+
+    if choice == "xpu":
+        if not torch.xpu.is_available():
+            sys.exit("no Intel GPU visible to PyTorch; use the anomaly/ venv (XPU build) or --accelerator cpu")
+        from anomalib.engine import SingleXPUStrategy, XPUAccelerator
+
+        print(f"training on Intel GPU: {torch.xpu.get_device_name(0)}")
+        return {"accelerator": XPUAccelerator(), "strategy": SingleXPUStrategy(), "devices": 1}
+    print("training on CPU")  # Patchcore/Padim only extract features: seconds on the Core Ultra CPU
+    return {"accelerator": "cpu"}
+
+
 def quantize_int8(fp_xml: Path, calib_images: list[Path], size: int, out_xml: Path):
     """Post-training INT8 quantization with NNCF, calibrated on good images.
 
@@ -102,7 +117,9 @@ def main():
     ap.add_argument("--size", type=int, default=256, help="square model input size")
     ap.add_argument("--epochs", type=int, default=1, help="Patchcore/Padim need 1; EfficientAd ~ 20+")
     ap.add_argument("--int8", action="store_true", help="also export an NNCF INT8 model")
-    ap.add_argument("--accelerator", default="auto", help="Lightning accelerator: auto, cpu, xpu")
+    ap.add_argument("--accelerator", default="cpu", choices=["cpu", "xpu"],
+                    help="cpu (default) or xpu (Intel GPU; experimental: Patchcore training currently "
+                         "triggers an xe driver page fault on this laptop)")
     args = ap.parse_args()
 
     from anomalib.data import Folder
@@ -131,7 +148,7 @@ def main():
     dm = datamodule(1 if args.model == "efficient_ad" else 8)  # EfficientAd requires batch size 1
     model = build_model(args.model)
     work = args.out.parent / f".{args.out.name}-work"
-    engine = Engine(max_epochs=args.epochs, default_root_dir=work, accelerator=args.accelerator)
+    engine = Engine(max_epochs=args.epochs, default_root_dir=work, **trainer_device(args.accelerator))
     engine.fit(model=model, datamodule=dm)
 
     # A fixed input size is required: with the default dynamic shape the exported

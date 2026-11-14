@@ -9,7 +9,7 @@ defective bowl. See [AGENTS.md](AGENTS.md) for the task and hardware.
 | Env | Path | Used for |
 |---|---|---|
 | Studio venv | `~/physical-ai-studio/application/backend/.venv` | the cell, poses, dataset tools (has physicalai, LeRobot, OpenVINO) |
-| Repo venv | `.venv` (`uv sync --group anomaly`) | Anomalib training only |
+| Anomaly venv | `anomaly/.venv` (`uv sync --project anomaly`) | Anomalib training (PyTorch XPU build) |
 
 ```bash
 PY=~/physical-ai-studio/application/backend/.venv/bin/python
@@ -44,7 +44,7 @@ or cameras.** Studio locks them while a session is open.
    ```
 6. **Train the anomaly model** (repo venv):
    ```bash
-   uv run --group anomaly python anomaly/train.py --data data/anomaly --out models/anomaly --int8
+   anomaly/.venv/bin/python anomaly/train.py --data data/anomaly --out models/anomaly --int8
    $PY -m cell.anomaly models/anomaly-int8 --bench   # latency per device
    ```
 7. **Dry run without hardware**, then for real:
