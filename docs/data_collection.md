@@ -39,6 +39,10 @@ before recording: the policy learns positions from the camera images. For the
 same reason, never move or remove tags once recording has started; they are
 part of every image the policy trains on.
 
+The running cell makes the same check by itself before every brick
+(`./biddy run`, [README](../README.md#apriltag-check)), so this manual check
+is for recording sessions.
+
 ## Who sees which face
 
 The wrist camera looks along the jaws, so it never sees the faces the jaws
@@ -73,9 +77,13 @@ tips, so a fixed crop is enough for Anomalib.
 
 ## One episode
 
-Type the task in the Task box before pressing start:
+Type the task in the Task box before pressing start, exactly one of:
 - `put the brick in the good bowl`
 - `put the brick in the defective bowl`
+
+Never name the colour or the brick type in the task. The cell tells long
+bricks from standard ones by shape at the side spot (`shape` column of
+`./biddy check`), and a third phrase would be a task the cell never asks for.
 
 Moves:
 
@@ -131,6 +139,43 @@ What makes a demo good:
 - One or two joints at a time where possible: base, then reach, then wrist.
 - Keep hands and the leader arm out of the follower's cameras.
 - Do 2 or 3 practice runs before recording.
+
+## Long bricks
+
+A long brick can't be turned 90° in the jaws, so its route differs only in
+the regrasp. Faces are named by the first grasp, as for standard bricks:
+
+1. Hover, then grasp **one end** (jaws on the two long sides, close to the end).
+2. Inspection spot: hold 1 s (`back`), tilt up, hold 1 s (`bottom`).
+3. Regrasp: put it down on the regrasp spot, open, move along the brick to
+   **the other end** (no wrist roll), close.
+4. Inspection spot: hold 1 s, roll 180°, hold 1 s (the end that was in the
+   jaws is now in view).
+5. Drop in the task's bowl, home.
+
+Same four holds and the same spots as a standard brick: if a long brick
+sticks out of the inspection image, move the hold pose for **both** types
+rather than giving long bricks their own pose. Record both long variants,
+good and defective, about 10 to 15 full-route episodes in all.
+
+## A perfect episode
+
+Record only perfect episodes into `pick-inspect-sort`; extra still clips for
+Anomalib go to `anomaly-extra`. Perfect means:
+
+- starts and ends at the home pose, still
+- one clean grasp and one clean regrasp, no retries
+- all four holds at the usual spots, each still for at least 1 s
+- the full route even for a defective brick (no stopping after the marked face)
+- the bowl matches the task
+
+After each session, **Finish recording**, then check only the new episodes:
+
+    ./biddy check pick-inspect-sort --from <first new episode>
+
+Delete in Studio every new episode with a flag after its task text, and
+check that the `shape` column says `long` for long bricks once
+`inspection.brick_types.long.min_elongation` is set in station.yaml.
 
 ## Positions
 

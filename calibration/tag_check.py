@@ -22,12 +22,14 @@ in the same home pose each time.
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from make_tags import ASSIGNMENTS
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from cell.tags import ASSIGNMENTS, detect, make_detector  # noqa: E402  (the cell runs the same detection)
 
 TOLERANCE_FRAC = 8.0 / 1920  # allowed center shift, as a fraction of frame width
 WIDTH, HEIGHT = 1920, 1080  # requested capture size; the camera may give less
@@ -37,29 +39,6 @@ STUDIO = "localhost:7860"
 STUDIO_PROJECT = "biddy"
 STUDIO_BACKEND = Path("~/physical-ai-studio/application/backend").expanduser()
 MIN_TOLERANCE_PX = 4.0  # detection jitter at 640x480 is up to about 3 px
-
-
-def make_detector():
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-    params = cv2.aruco.DetectorParameters()
-    # Wider threshold windows and a lower constant than the defaults: tags with
-    # tape on the white margin or glare on the table are otherwise missed.
-    params.adaptiveThreshWinSizeMin = 5
-    params.adaptiveThreshWinSizeMax = 85
-    params.adaptiveThreshWinSizeStep = 8
-    params.adaptiveThreshConstant = 3
-    return cv2.aruco.ArucoDetector(dictionary, params)
-
-
-def detect(frames, detector):
-    """Median center per tag over all frames in which it was detected."""
-    seen = {}
-    for frame in frames:
-        corners, ids, _ = detector.detectMarkers(frame)
-        if ids is not None:
-            for c, i in zip(corners, ids.flatten()):
-                seen.setdefault(int(i), []).append(c.reshape(4, 2).mean(axis=0))
-    return {i: np.median(np.array(pts), axis=0).tolist() for i, pts in seen.items()}
 
 
 def grab(camera):
