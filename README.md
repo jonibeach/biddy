@@ -39,42 +39,47 @@ laptop (`anomaly/train.py --accelerator xpu`); Patchcore on the CPU takes second
 
 ## From recorded demos to a running cell
 
-1. **Record** in Studio, one task per bowl, e.g. "put the brick in the good bowl"
-   and "put the brick in the defective bowl" (they must match `policy.tasks` in
-   `station.yaml`). Pause briefly with the brick at the inspection camera in
-   every demo. **End the recording session** so Studio writes the dataset.
-2. `./biddy check`: flags bad episodes to delete in Studio.
-3. `./biddy train-policy --policy smolvla --name smolvla-v1 [--trainer <name>]`:
-   trains in Studio and waits; `./biddy status` lists datasets, trainers, jobs, models.
-4. `./biddy poses record`: at least `home` and `inspect` (bowls too for scripted drops).
-5. Anomaly model from the demos, no extra recording:
-   ```bash
-   ./biddy extract latest --no-crop     # full frames, to pick the crop box
-   ./biddy roi data/anomaly/good/<any>.png
-   ./biddy anomaly                      # extract crops -> train -> INT8 -> benchmark
-   ```
-6. `./biddy mock --cycles 6`, then `./biddy run --cycles 5 --show`.
+1. **Record** in Studio following [docs/data_collection.md](docs/data_collection.md),
+   with exactly two task phrases: `put the brick in the good bowl` and
+   `put the brick in the defective bowl` (they must match `policy.tasks`).
+   Mix colours, and good and defective bricks. **Finish recording** so Studio
+   writes the dataset.
+2. `./biddy check`: per episode, holds per inspection spot and teleop jumps;
+   per colour, good/defective counts. Delete flagged episodes in Studio.
+3. If the inspection spots or arm poses changed, run
+   `$PY scripts/find_spots.py` and copy the spot poses into
+   `inspection.views.<view>.poses`; set crop boxes with `./biddy roi --view <view> <image>`.
+4. `./biddy train-policy --policy smolvla --name smolvla-v1 [--trainer <name>]`.
+5. `./biddy poses record --only home` (plus the bowls for scripted drops).
+6. `./biddy anomaly`: crops per view from the demos -> train -> INT8 -> benchmark.
+7. `./biddy mock --cycles 6` (mechanics only), then `./biddy run --cycles 5 --show`.
 
-Steps 2 and 5 together: `./biddy prepare`. Each run writes
-`runs/<time>/cycles.csv` (outcome, verdict, score, timings per brick) and the
-inspection crops, and prints cycle time, re-grasps and failures.
+Each run writes `runs/<time>/cycles.csv` (verdict, worst face and view, score
+vs threshold, holds, timings per brick) and each brick's worst crop.
+
+## Inspection views
+
+`station.yaml` `inspection.views` lists one Anomalib model per view: a crop
+box on a camera. The station holds the brick at two spots in the inspection
+image (`side`: centre, `bottom`: bottom right) and the wrist camera sees the
+brick before the grasp (`wrist`, the hover view). A hold belongs to a view
+when the arm is at one of that view's `poses` (from `scripts/find_spots.py`)
+and its crop differs from the empty view. Colours and orientations: training
+adds rotated/flipped copies of good crops (`anomaly/train.py --augment`), and
+thresholds are picked per episode from its worst face, since a defective brick
+has its mark on one face only.
 
 ## How a cycle works
 
-`cell/run.py`: the policy runs with the "good" task until the arm holds still
-at the `inspect` pose. The inspection camera's view is compared with the empty
-view grabbed at home: no change means nothing was grasped, so the arm goes home
-and picks again. Otherwise the Anomalib model scores the crop; borderline
-scores get a second look on fresh frames. Then, per `policy.drop`:
-
-- `task_switch` (default): the policy continues with the verdict's task until
-  the gripper opens over a bowl.
-- `scripted`: the policy stops and the arm replays the recorded bowl pose.
-
-The policy and the inspection share the same camera stream. With
-`policy.drop_model` set, one policy picks (e.g. ACT) and another sorts (e.g.
-SmolVLA). Every policy action is checked before it reaches the arm: NaN ends
-the run, everything else is clamped to the calibrated joint range.
+`cell/run.py`: the policy plays a whole demo per brick. A runtime callback spots
+holds and a background thread scores each with its view's model on the NPU.
+As soon as one face fails, the policy's task switches to the defective bowl,
+which is before the drop. The brick is done when the arm is back home. A run
+with no inspection hold was a missed grasp: the policy tries again. With
+`policy.drop: scripted` (or a separate `policy.drop_model`), the policy stops
+after `inspection.holds_per_brick` holds and the arm replays the bowl pose (or
+the drop policy takes over). Every policy action is checked before it reaches
+the arm: NaN ends the run, everything else is clamped to the joint range.
 
 ## Layout
 
@@ -87,6 +92,8 @@ the run, everything else is clamped to the calibrated joint range.
 | `cell/hardware.py` | real and mock arm, cameras, policy |
 | `cell/poses.py` | record poses by hand, smooth scripted moves |
 | `cell/anomaly.py` | OpenVINO anomaly scoring |
+| `cell/inspection.py` | hold detection and the worst-face verdict |
+| `scripts/find_spots.py` | find the arm poses of the inspection spots in the demos |
 | `cell/bench.py` | latency of every model on CPU/GPU/NPU |
 | `cell/train_policy.py` | train a policy through Studio's API |
 | `cell/intel.py` | expose the NPU to OpenVINO |

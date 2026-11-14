@@ -589,10 +589,21 @@ def build_real(cfg: dict):
 
 
 def build_mock(cfg: dict, poses: dict, miss_every: int):
-    from cell.hardware import MockArm, MockCamera, MockPolicy, MockStation
+    from cell.hardware import MOCK_POSES, MockArm, MockCamera, MockPolicy, MockStation
 
     arm = MockArm(start=poses["home"])
     views = cfg["inspection"]["views"]
+    # The mock arm follows its own route, so its spots replace the station's
+    # recorded spot poses and crop boxes (mock only; station.yaml is untouched).
+    mock_views = {
+        "side": {"camera": "inspection", "roi": [240, 160, 160, 160],
+                 "poses": [MOCK_POSES[p][:5] for p in ("inspect_back", "inspect_side1", "inspect_side2")]},
+        "bottom": {"camera": "inspection", "roi": [450, 310, 160, 160], "poses": [MOCK_POSES["inspect_bottom"][:5]]},
+        "wrist": {"camera": "wrist", "roi": [260, 280, 120, 120], "hover": True},
+    }
+    for name, v in views.items():
+        if name in mock_views:
+            v.update(mock_views[name])
     cams = {name: MockCamera(name) for name in cfg["studio"]["cameras"]}
     station = MockStation(arm, poses, views, miss_every=miss_every)
     for view in views:
