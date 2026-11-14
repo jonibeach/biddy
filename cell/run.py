@@ -154,8 +154,9 @@ class Watcher:
 
     end="home":  stop when the arm has left home and is back there, still (the
                  whole demo ran; with no inspection hold it was a missed grasp).
-    end="holds": stop once `holds` inspection holds have been scored (the
-                 policy hands over to a drop policy or scripted drop).
+    end="holds": stop once `holds` inspection holds have been scored, or as
+                 soon as a face fails (the policy hands over to a drop policy
+                 or scripted drop).
     """
 
     # Studio's normalized joint ranges: body joints -100..100, gripper 0..100.
@@ -224,7 +225,8 @@ class Watcher:
             self.home_still = self.home_still + 1 if at_home and still else 0
             if self.left_home and self.home_still >= self.hold_ticks:
                 self._finish()
-        elif self.end == "holds" and self.inspector.verdict.holds >= self.holds_wanted:
+        elif self.end == "holds" and (self.inspector.verdict.holds >= self.holds_wanted
+                                      or self.inspector.switched):  # a failed face: no need to see the rest
             self._finish()
 
     def _finish(self):
@@ -445,7 +447,9 @@ class Cell:
                 done, c.episode_s = self._policy("pick", self.pick_task, timeout, "holds", holds_wanted)
             self.inspector.sync()
             v = self.inspector.verdict
-            if v.holds == 0:
+            # No inspection hold is a missed grasp, unless the wrist camera already
+            # found the defect: demos may go straight to the defective bowl then.
+            if v.holds == 0 and not v.defective:
                 c.outcome, c.note = "no_brick", "no inspection hold showed a brick"
                 c.home_s = self._move(self.poses["home"], gripper=float(self.cfg["scripted"]["gripper_open"]))
                 if hasattr(self.insp_cam, "regrasp"):

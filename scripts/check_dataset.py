@@ -58,21 +58,33 @@ def main():
         n_insp = sum(h.kind != hover_view for h in holds)
         n_wrist = sum(h.kind == hover_view for h in holds)
         per_view = Counter(h.kind for h in holds if h.kind != hover_view)
-        if e.seconds < 0.5 * med:
+        # Compare with episodes of the same task: defective demos may stop after the failed face.
+        task_med = float(np.median([x.seconds for x in eps if x.task == e.task]))
+        if e.seconds < 0.5 * task_med:
             flags.append("short")
-        if e.seconds > 2.0 * med:
+        if e.seconds > 2.0 * task_med:
             flags.append("long")
         if grip_range < 10:
             flags.append("gripper barely moves")
         if jump > args.jump:
             flags.append(f"action jump {jump:.0f}")
-        if n_insp < expected:
-            flags.append(f"{n_insp} inspection holds, protocol has {expected}")
-        if hover_view and n_wrist == 0:
-            flags.append("no hover hold before the grasp")
-        for v in insp_views:
-            if per_view[v] == 0:
-                flags.append(f"brick never at the {v} spot")
+        full = n_insp >= expected and all(per_view[v] for v in insp_views) and (not hover_view or n_wrist)
+        if n_insp + n_wrist == 0:
+            flags.append("no hold at all: the brick was never shown to a camera")
+        elif not full:
+            if "defective" in e.task:
+                # The defect may have been seen already (fine for Anomalib), but the
+                # policy learns the whole route: early stops teach a route the cell never uses.
+                flags.append("stopped early: fine for Anomalib, drop or redo for policy training")
+            else:
+                # A good brick is only known good once every face was shown.
+                if n_insp < expected:
+                    flags.append(f"{n_insp} inspection holds, protocol has {expected}")
+                if hover_view and n_wrist == 0:
+                    flags.append("no hover hold before the grasp")
+                for v in insp_views:
+                    if per_view[v] == 0:
+                        flags.append(f"brick never at the {v} spot")
         if "|" in e.task:
             flags.append("several tasks in one episode")
         if flags:
