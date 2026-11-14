@@ -9,6 +9,36 @@ Studio keeps a recording session's episodes in its cache. They only reach the
 dataset after **Finish recording**, so finish each session before training or
 frame extraction.
 
+## Station layout
+
+The AprilTags are in their final positions (sheet and ID mapping:
+[calibration/make_tags.py](../calibration/make_tags.py)). Their reference
+pixel positions are in `calibration/reference_top.json` and
+`reference_inspection.json`, taken from Studio's 640x480 stream.
+
+| Camera | Tags seen | Object |
+|---|---|---|
+| top | 0, 1, 2, 3 | table corners |
+| top | 4, 5, 7 | arm base |
+| top | 8, 9 | inspection camera stand |
+| top | 10 / 11 | good bowl / defective bowl |
+| inspection | 12 to 15 | inspection background |
+
+Tag 6 (arm base) is not detected in the top view. Clear it and save the
+reference again if you want it tracked.
+
+Before each recording session, check nothing moved. This reads Studio's
+camera feed and works while Studio is recording:
+
+    cd calibration
+    ~/physical-ai-studio/application/backend/.venv/bin/python tag_check.py --studio --name top
+    ~/physical-ai-studio/application/backend/.venv/bin/python tag_check.py --studio --name inspection
+
+A tag that moved means the camera or that object was bumped. Put it back
+before recording: the policy learns positions from the camera images. For the
+same reason, never move or remove tags once recording has started; they are
+part of every image the policy trains on.
+
 ## Who sees which face
 
 The wrist camera looks along the jaws, so it never sees the faces the jaws
@@ -64,6 +94,43 @@ Moves:
 Keep every hold still and in the same place each episode: those frames become
 the Anomalib images. Aim for 30 to 40 s per episode; move quickly between
 holds rather than shortening them.
+
+## Moving the leader arm
+
+Set up once:
+1. Tape the regrasp spot on the table. Pick a home pose for the leader arm
+   (resting, gripper open) so every episode starts and ends the same.
+2. Find the inspection pose: watch the inspection camera in Studio and move
+   the brick until it sits near the centre and fills about a quarter of the
+   image. Come back to that same pose every time.
+3. Hold the leader by its wrist and handle, not the upper links. It moves
+   more smoothly and stops dead for the holds.
+
+Each episode:
+1. Leader at home, gripper open. Start.
+2. Swing the base toward the brick, then lower shoulder and elbow together in
+   one smooth reach, stopping about 5 cm above the brick.
+3. Roll the wrist so the jaws are square to the brick's sides, while still
+   hovering. Hold 0.5 s.
+4. Go straight down and close fully. A half grip slips in the regrasp.
+5. Lift straight up about 5 cm before moving sideways.
+6. Move in one path to the inspection pose. Hold 1 s (`back`). Tilt the wrist
+   up, hold 1 s (`bottom`).
+7. Lower the brick onto the regrasp spot until it touches, open, rise about
+   3 cm, roll the wrist 90°, go down, close.
+8. Back to the inspection pose. Hold 1 s, roll the wrist 180°, hold 1 s
+   (both `side` faces).
+9. Over the task's bowl, open, go home. Stop when at home and still.
+
+What makes a demo good:
+- Only the brick's start position changes between episodes. Route,
+  inspection pose, regrasp spot and bowls stay the same.
+- Steady speed with no pauses except the holds. The policy copies hesitation.
+- No corrections on camera. Missed a grasp: discard and redo.
+- Holds fully still, or the inspection frames blur.
+- One or two joints at a time where possible: base, then reach, then wrist.
+- Keep hands and the leader arm out of the follower's cameras.
+- Do 2 or 3 practice runs before recording.
 
 ## Positions
 

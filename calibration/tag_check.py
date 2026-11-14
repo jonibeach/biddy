@@ -1,9 +1,17 @@
 """Detect AprilTags from a camera and check whether the fixed parts moved.
 
 Usage:
-  python tag_check.py --camera 0 --name top --save-reference   # once, after setup
-  python tag_check.py --camera 0 --name top                    # each session
-  python tag_check.py --image shot.png --name top              # test on a saved image
+  python tag_check.py --studio --name top --save-reference     # once, after setup
+  python tag_check.py --studio --name top                      # each session
+  python tag_check.py --camera 0 --name top                    # camera not held by Studio
+  python tag_check.py --image a.jpg b.jpg --name top           # saved images instead
+
+--studio reads Physical AI Studio's shared camera feed as one more viewer,
+at the size Studio records with (640x480). It works while Studio is running,
+also during recording, and needs Studio's backend venv:
+  ~/physical-ai-studio/application/backend/.venv/bin/python tag_check.py --studio ...
+The saved references were made with --studio, so check with --studio too:
+pixel positions depend on capture size.
 
 Reports the pixel center of each tag, grouped by object, and compares it
 to reference_<name>.json. Reading the result for a fixed camera:
@@ -21,10 +29,14 @@ import numpy as np
 
 from make_tags import ASSIGNMENTS
 
-TOLERANCE_PX = 8.0  # allowed center shift before a tag counts as moved
+TOLERANCE_FRAC = 8.0 / 1920  # allowed center shift, as a fraction of frame width
 WIDTH, HEIGHT = 1920, 1080  # requested capture size; the camera may give less
 WARMUP_FRAMES = 15  # let auto-exposure settle before detecting
 DETECT_FRAMES = 10  # a tag counts as visible if any of these frames shows it
+STUDIO = "localhost:7860"
+STUDIO_PROJECT = "biddy"
+STUDIO_BACKEND = Path("~/physical-ai-studio/application/backend").expanduser()
+MIN_TOLERANCE_PX = 4.0  # detection jitter at 640x480 is up to about 3 px
 
 
 def make_detector():
@@ -67,19 +79,62 @@ def grab(camera):
     return frames
 
 
+def grab_studio(name):
+    """Frames of the Studio project camera called `name`, read from Studio's
+    shared camera feed as one more viewer. Works while a recording session is
+    open, and never takes the camera from Studio."""
+    import sys
+    import time
+    import urllib.request
+
+    sys.path.insert(0, str(STUDIO_BACKEND / "src"))
+    from pydantic import TypeAdapter
+    from schemas.project_camera import Camera
+    from utils.camera_factory import build_shared_camera
+
+    def get(path):
+        return json.load(urllib.request.urlopen(f"http://{STUDIO}{path}"))
+
+    project = next(p for p in get("/api/projects") if p["name"] == STUDIO_PROJECT)
+    camera = next((c for c in get(f"/api/projects/{project['id']}/cameras") if c["name"] == name), None)
+    if camera is None:
+        raise SystemExit(f"Studio project {STUDIO_PROJECT!r} has no camera called {name!r}")
+    shared = build_shared_camera(
+        config=TypeAdapter(Camera).validate_python(camera), validate_on_connect=False, overwrite_settings=False
+    )
+    shared.connect()
+    frames, last, deadline = [], None, time.monotonic() + 10
+    try:
+        while len(frames) < DETECT_FRAMES:
+            if time.monotonic() > deadline:
+                raise SystemExit(f"No frames from Studio camera {name!r}; is Studio running?")
+            frame = shared.read_latest()
+            if frame.sequence != last:
+                last = frame.sequence
+                frames.append(cv2.cvtColor(frame.data, cv2.COLOR_RGB2BGR))
+            time.sleep(0.02)
+    finally:
+        shared.disconnect()
+    return frames
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, help="camera index")
-    ap.add_argument("--image", type=str, help="image file instead of camera")
+    ap.add_argument("--image", nargs="+", help="image files instead of a camera")
+    ap.add_argument("--studio", action="store_true", help="read the camera named --name from Studio")
     ap.add_argument("--name", required=True, help="which camera this is: top, inspection or wrist")
     ap.add_argument("--save-reference", action="store_true")
     args = ap.parse_args()
     REF_FILE = Path(__file__).with_name(f"reference_{args.name}.json")
 
     if args.image:
-        frames = [cv2.imdecode(np.fromfile(args.image, np.uint8), cv2.IMREAD_COLOR)]
+        frames = [cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR) for f in args.image]
+    elif args.studio:
+        frames = grab_studio(args.name)
     else:
         frames = grab(args.camera)
+    tolerance = max(MIN_TOLERANCE_PX, TOLERANCE_FRAC * frames[0].shape[1])
 
     found = detect(frames, make_detector())
 
@@ -104,7 +159,7 @@ def main():
     for i, (x, y) in found.items():
         if i in ref:
             d = float(np.hypot(x - ref[i][0], y - ref[i][1]))
-            if d > TOLERANCE_PX:
+            if d > tolerance:
                 moved.append((i, ASSIGNMENTS.get(i, "?"), d))
     missing = sorted(i for i in ref if i not in found)
     if moved:
