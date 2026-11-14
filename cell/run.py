@@ -51,7 +51,7 @@ from cell import studio
 from cell import tags as tags_mod
 from cell.anomaly import AnomalyModel, overlay
 from cell.anomaly import Verdict as Score
-from cell.inspection import Verdict, hold_kind, near, presence, score_crop, split_views, view_crop
+from cell.inspection import Verdict, at_pose, hold_kind, near, presence, score_crop, split_views, view_crop
 
 # --- inspector: scores holds in the background --------------------------------
 
@@ -181,6 +181,8 @@ class Watcher:
         self.hold_ticks = max(1, int(float(cfg.get("hold_min_s", 0.3)) * fps))
         self.sample_every = max(1, int(fps / 10))
         self.stop = None  # set to runtime.stop
+        self.save_dir: Path | None = None  # set by the cell: runs/<time>/nearspot
+        self.phase_tag = ""
         self.begin("home", None)
 
     def begin(self, end: str, home: np.ndarray | None, holds: int = 0):
@@ -195,6 +197,9 @@ class Watcher:
         self.home_still = 0
         self.left_home = False
         self.motion: list[tuple] = []  # (t, state, action_sent, loop_s, sleep_s, stale) per tick
+        self.speed_ema = 0.0
+        self.saved_near = 0
+        self.last_near_save = 0.0
 
     def on_action_ready(self, *, action, step):
         """Last check before a policy action reaches the arm.
@@ -218,10 +223,21 @@ class Watcher:
             speed = float(np.max(np.abs(state - self.prev[1]))) / (now - self.prev[0])  # gripper included
         self.prev = (now, state)
         self.state = state
+        # Smoothed over ~0.15 s: per-tick speed at 90 Hz is noisy.
+        self.speed_ema = 0.85 * self.speed_ema + 0.15 * speed
         if self.done:
             return
-        still = speed <= float(self.cfg["still_speed"])
+        # The policy rarely stops as dead still as the demos (offline extraction uses
+        # still_speed 15 on them), so live holds use live_still_speed, and a looser
+        # limit right at an inspection spot so a slow pass still gets scored.
+        at_spot = self.at_spot(state)
+        limit = float(self.cfg.get("live_still_speed", 35.0))
+        if at_spot:
+            limit = max(limit, float(self.cfg.get("live_spot_speed", 60.0)))
+        still = self.speed_ema <= limit
         self.still = self.still + 1 if still else 0
+        if at_spot and event.camera_frames:
+            self._save_near_spot(now, event.camera_frames)
 
         if self.in_hold and not still:
             self.in_hold = False
@@ -249,6 +265,26 @@ class Watcher:
             # before the grasp, and handing over then would drop an empty gripper.
             if v.holds >= self.holds_wanted or (self.inspector.switched and v.holds >= 1):
                 self._finish()
+
+    def at_spot(self, state: np.ndarray) -> bool:
+        """Within pose_tolerance of any inspection view's recorded spot pose."""
+        tol = float(self.cfg.get("pose_tolerance", 10.0))
+        for v in self.cfg["views"].values():
+            if not v.get("hover") and at_pose(state, v, tol) is not None:
+                return True
+        return False
+
+    def _save_near_spot(self, now: float, frames: dict):
+        """Keep inspection and wrist frames ~3x/s near a spot (max 60 per run), for review."""
+        if self.save_dir is None or self.saved_near >= 60 or now - self.last_near_save < 0.33:
+            return
+        self.last_near_save = now
+        self.saved_near += 1
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        for cam in ("inspection", "wrist"):
+            if cam in frames:
+                cv2.imwrite(str(self.save_dir / f"{self.phase_tag}_{self.saved_near:03d}_{cam}.jpg"),
+                            cv2.cvtColor(frames[cam].data, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
 
     def _finish(self):
         self.done = True
@@ -414,10 +450,20 @@ class Cell:
         # actions make a staircase (jitter). Split every action into `interpolate`
         # linearly interpolated commands (3 -> 90 Hz), as Studio's own robot loop does.
         self.interpolate = int(self.pcfg.get("interpolate", 3))
+        from physicalai.runtime import LowPassFilterCallback
+
         tick_hz = float(self.pcfg["fps"]) * self.interpolate
         self.watcher = Watcher(self.inspector, self.icfg, tick_hz)
+        self.watcher.save_dir = log.dir / "nearspot"
+        # The fine-tuned policy's actions are ~7x jerkier than the demos; an EMA on
+        # the 30 Hz actions (reset at every run) smooths them before the safety
+        # check. Lower alpha = smoother but laggier; 1 = off.
+        callbacks = [self.watcher]
+        alpha = float(self.pcfg.get("smoothing", 0.35))
+        if alpha < 1.0:
+            callbacks.insert(0, LowPassFilterCallback(alpha=alpha))
         self.runtime = RobotRuntime(robot=arm, action_source=self.source, fps=float(self.pcfg["fps"]),
-                                    cameras=cameras, callbacks=[self.watcher],
+                                    cameras=cameras, callbacks=callbacks,
                                     interpolator=LinearInterpolator(multiplier=self.interpolate))
         self.watcher.stop = self.runtime.stop
         self.insp_cam = cameras[self.icfg["views"][self.insp_views[0]]["camera"]]
@@ -432,6 +478,7 @@ class Cell:
         self.source.use(phase)
         self.source.current.set_task(task)
         self.watcher.begin(end, self.poses["home"], holds)
+        self.watcher.phase_tag = f"b{len(self.log.rows) + 1:03d}_{phase}"
         t0 = time.monotonic()
         self.runtime.run(duration_s=timeout, stop_event=self.stop_event)
         self._save_motion(phase)
@@ -449,6 +496,10 @@ class Cell:
             return
         brick = len(self.log.rows) + 1
         path = self.log.dir / f"motion_{brick:04d}_{phase}.csv"
+        n = 2
+        while path.exists():  # retries of the same brick keep their own file
+            path = self.log.dir / f"motion_{brick:04d}_{phase}_{n}.csv"
+            n += 1
         names = ["pan", "lift", "elbow", "wflex", "wroll", "grip"]
         t0 = rows[0][0]
         with path.open("w", newline="") as f:

@@ -18,9 +18,11 @@ policy:
   # null = the same policy does both.
   drop_model: null
   device: GPU              # OpenVINO device for the policy: CPU, GPU, NPU
+  smoothing: 0.35          # EMA on the policy's actions (1 = off); the policy is jerkier than the demos
+  interpolate: 3           # commands per action: 30 Hz actions -> 90 Hz smooth targets for the SO-101
   precision: auto          # auto (FP16, FP32 if FP16 gives NaN), f16, f32
   fps: 30
-  mode: async              # sync waits for each chunk; async infers while the arm moves
+  mode: sync               # sync: plan each chunk from the current frame (async replayed ~140 ms stale chunks: jitter)
   # Task text per phase; must match the task text the policies were trained on.
   # pick is optional (defaults to the good task: the pick looks the same).
   tasks:
@@ -56,6 +58,11 @@ inspection:
       poses:         # arm poses (5 body joints) at which demos show this spot
         - [-23.0, -98.4, 98.0, 6.8, -0.7]
         - [5.2, -98.5, 98.0, 4.3, 2.3]
+        # long bricks held by one end, wrist rolled about +-50 (dataset "test", scripts/find_spots.py)
+        - [5.1, -98.9, 97.9, -7.2, -52.4]
+        - [6.5, -98.9, 97.9, 2.1, 50.1]
+        - [-22.6, -98.9, 97.9, -0.7, -53.4]
+        - [-20.1, -98.9, 97.9, 8.2, 53.9]
     bottom:          # bottom of the inspection image, brick tilted to show its tubes
       camera: inspection
       crop: brick
@@ -74,6 +81,8 @@ inspection:
   # A hold: the arm still (joint speed below still_speed, units/s) for at least
   # hold_min_s, away from home (any body joint further than home_tolerance).
   still_speed: 15.0
+  live_still_speed: 35.0   # live cell: the policy never stops as dead still as the demos
+  live_spot_speed: 60.0    # live cell, within pose_tolerance of a spot: a slow pass still counts
   hold_min_s: 0.3
   home_tolerance: 8.0
   pose_tolerance: 10.0     # a hold is at a view's pose when every body joint is this close
