@@ -69,6 +69,8 @@ def move_to(arm, target: np.ndarray, speed: float = 60.0, hz: float = 50.0, sett
         time.sleep(1 / hz)
     deadline = time.monotonic() + settle
     while time.monotonic() < deadline:
+        if stop is not None and stop.is_set():
+            return False
         pos = arm.get_observation().joint_positions
         if body_distance(pos, target) <= tolerance:
             return True

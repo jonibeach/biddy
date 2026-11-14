@@ -28,7 +28,7 @@ def build_arm(cfg: dict):
     rec = studio.robot(cfg["studio"]["follower"], cfg["studio"]["db"])
     if rec.unit != "normalized":
         raise ValueError(f"{rec.name} uses unit {rec.unit!r}; the cell's tolerances assume 'normalized'")
-    return SO101(port=studio.find_port(rec), calibration=SO101Calibration(joints=rec.calibration),
+    return SO101(port=studio.find_port(rec), calibration=SO101Calibration.from_dict(rec.calibration),
                  role="follower", unit=rec.unit)
 
 
