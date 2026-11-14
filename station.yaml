@@ -1,0 +1,63 @@
+# Station config for the inspection cell (cell/run.py). Robot calibration,
+# serial numbers and camera identities are read from Physical AI Studio's
+# database, so the cell drives exactly what Studio recorded with.
+
+studio:
+  db: ~/.local/share/physicalai/data/physicalai.db
+  follower: SO101 Follower v2      # project_robots.name
+  cameras: [top, wrist, inspection]  # project_cameras.name, same keys the policy was trained on
+
+poses: poses.json  # written by: python -m cell.poses record
+
+policy:
+  # Which Studio model to run: "latest", "latest:<policy>" (e.g. latest:act),
+  # a Studio model name, or a path to an exports/openvino folder.
+  model: latest
+  # Optional second policy for the drop phase, e.g. ACT picks and brings the
+  # brick to inspection, then SmolVLA sorts it using the verdict's task text.
+  # null = the same policy does both.
+  drop_model: null
+  device: GPU              # OpenVINO device for the policy: CPU, GPU, NPU
+  precision: auto          # auto (FP16, FP32 if FP16 gives NaN), f16, f32
+  fps: 30
+  mode: async              # sync waits for each chunk; async infers while the arm moves
+  # Task text per phase; must match the task text the policies were trained on.
+  # pick is optional (defaults to the good task: the pick looks the same).
+  tasks:
+    pick: null
+    good: put the brick in the good bowl
+    defective: put the brick in the defective bowl
+  # How the brick gets into the bowl after inspection:
+  #   task_switch: keep running the policy, switching its task to the verdict's bowl
+  #   scripted:    stop the policy at the inspection pose and replay recorded bowl poses
+  drop: task_switch
+  pick_timeout_s: 30       # give up reaching the inspection pose after this long
+  drop_timeout_s: 20       # task_switch: stop the policy after this long past inspection
+
+inspection:
+  model: models/anomaly-int8  # anomaly/train.py --int8 output (NNCF INT8); models/anomaly for FP
+  # Policy on the GPU, inspection on the NPU, control loop on the CPU: the two
+  # models never compete for the same accelerator. GPU is fastest if the NPU
+  # is busy or missing; `python -m cell.anomaly <model> --bench` compares them.
+  device: NPU
+  camera: inspection
+  roi: null                # [x, y, w, h] crop in the 640x480 image; set with anomaly/roi.py
+  # The arm counts as "at inspection" when every body joint is within this many
+  # normalized units (-100..100 scale) of the inspect pose and nearly still.
+  pose_tolerance: 10.0
+  still_speed: 15.0        # max joint speed (units/s) to count as still
+  frames: 3                # score this many frames and use the median
+  # Re-grasp: the inspection crop is compared with the empty view grabbed while
+  # the arm is at home. Mean pixel difference (0-255) below presence_diff means
+  # no brick in the gripper: go home and pick again, up to max_regrasps times.
+  presence_diff: 12.0
+  max_regrasps: 2
+  # Second look: a score this close to the threshold is re-scored on fresh
+  # frames before deciding, instead of trusting one borderline reading.
+  uncertain_margin: 0.05
+
+scripted:
+  speed: 80.0              # units/s for scripted moves
+  gripper_open: 60.0       # gripper value that releases the brick
+
+runs_dir: runs

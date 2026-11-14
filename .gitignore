@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Station data and trained models (large, local only)
+/data/
+/models/
+/runs/
