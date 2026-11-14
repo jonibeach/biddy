@@ -1,0 +1,8 @@
+brick,label,defect_size,defect_face,start_position,notes
+lavender 2x2 #1,good,,,,
+lavender 2x2 #2,good,,,,
+D1,defective,full,top,,
+D2,defective,full,front,,
+D3,defective,full,back,,
+D4,defective,full,bottom,,
+D5,defective,full,side,,
