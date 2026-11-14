@@ -10,13 +10,21 @@ studio:
 poses: poses.json  # written by: python -m cell.poses record
 
 policy:
-  # "latest" = newest model Studio trained, or a path to an exports/openvino folder
+  # Which Studio model to run: "latest", "latest:<policy>" (e.g. latest:act),
+  # a Studio model name, or a path to an exports/openvino folder.
   model: latest
+  # Optional second policy for the drop phase, e.g. ACT picks and brings the
+  # brick to inspection, then SmolVLA sorts it using the verdict's task text.
+  # null = the same policy does both.
+  drop_model: null
   device: GPU              # OpenVINO device for the policy: CPU, GPU, NPU
+  precision: auto          # auto (FP16, FP32 if FP16 gives NaN), f16, f32
   fps: 30
   mode: async              # sync waits for each chunk; async infers while the arm moves
-  # Task text per phase. The pick task must match a task in the dataset.
+  # Task text per phase; must match the task text the policies were trained on.
+  # pick is optional (defaults to the good task: the pick looks the same).
   tasks:
+    pick: null
     good: put the brick in the good bowl
     defective: put the brick in the defective bowl
   # How the brick gets into the bowl after inspection:

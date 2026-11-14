@@ -56,12 +56,16 @@ def move_to(arm, target: np.ndarray, speed: float = 60.0, hz: float = 50.0, sett
     if gripper is not None:
         target[GRIPPER] = gripper
     start = np.asarray(arm.get_observation().joint_positions, np.float32)
+    if not (np.all(np.isfinite(target)) and np.all(np.isfinite(start))):
+        raise ValueError(f"non-finite joint values: start {start}, target {target}")
     duration = max(float(np.max(np.abs(target - start))) / speed, 0.05)
     t0 = time.monotonic()
     while True:
         if stop is not None and stop.is_set():
             return False
         s = min((time.monotonic() - t0) / duration, 1.0)
+        if time.monotonic() - t0 > duration + 5.0:  # never stream forever
+            return False
         s = s * s * (3 - 2 * s)  # ease in and out
         arm.send_action(start + (target - start) * s)
         if s >= 1.0:

@@ -77,6 +77,13 @@ def main():
     for k in ("good", "defective"):
         if tasks_cfg[k] not in known:
             print(f"  note: station.yaml task {k!r} = {tasks_cfg[k]!r} is not in this dataset")
+    if eps:
+        all_state = np.concatenate([e.state for e in eps])
+        names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+        for name, std in zip(names, all_state.std(axis=0)):
+            if std < 0.5:
+                print(f"note: {name} barely moves in the demos (std {std:.2f}); the policy may give NaN in FP16 "
+                      "on the GPU. The cell falls back to FP32 automatically (policy.precision: auto).")
     print(f"\nlength median {med:.1f}s; flagged {len(flagged)}: {flagged}")
     if inspect_pose is None:
         print("(no inspect pose in poses.json; 'insp' uses the longest mid-episode pause)")

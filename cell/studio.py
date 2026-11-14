@@ -97,16 +97,23 @@ def models(db: str | Path = DEFAULT_DB) -> list[ModelRecord]:
 
 
 def resolve_policy_dir(spec: str, db: str | Path = DEFAULT_DB) -> Path:
-    """'latest' -> newest Studio model with an OpenVINO export; otherwise a path.
-
-    A path may point at the export folder itself or at a Studio model folder.
+    """'latest' -> newest Studio model with an OpenVINO export; a Studio model
+    name, or 'latest:<policy>' (e.g. latest:act) -> that model's export;
+    otherwise a path to the export folder itself or to a Studio model folder.
     """
-    if spec == "latest":
-        for m in models(db):
-            if (m.export_dir / "manifest.json").exists():
-                return m.export_dir
-        raise FileNotFoundError("no trained model with an OpenVINO export in Studio yet")
     path = Path(spec).expanduser()
+    if not path.exists():
+        if spec == "latest":
+            match = lambda m: True  # noqa: E731
+        elif spec.startswith("latest:"):
+            policy = spec.split(":", 1)[1].lower()
+            match = lambda m: (m.policy or "").lower() == policy  # noqa: E731
+        else:
+            match = lambda m: m.name == spec  # noqa: E731
+        for m in models(db):  # newest first
+            if match(m) and (m.export_dir / "manifest.json").exists():
+                return m.export_dir
+        raise FileNotFoundError(f"no Studio model matching {spec!r} with an OpenVINO export yet")
     for candidate in (path, path / "exports" / "openvino"):
         if (candidate / "manifest.json").exists():
             return candidate

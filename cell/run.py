@@ -69,6 +69,21 @@ class Watcher:
         self.released_at: float | None = None
         self.state: np.ndarray | None = None
 
+    # Studio's normalized joint ranges: body joints -100..100, gripper 0..100.
+    LOW = np.array([-100, -100, -100, -100, -100, 0], np.float32)
+    HIGH = np.full(6, 100, np.float32)
+
+    def on_action_ready(self, *, action, step):
+        """Last check before a policy action reaches the arm.
+
+        A NaN/inf action (a broken or untrained export) ends the run instead of
+        being sent; everything else is clamped to the calibrated joint range.
+        """
+        action = np.asarray(action, np.float32)
+        if not np.all(np.isfinite(action)):
+            raise ValueError(f"policy produced a non-finite action at step {step}: {action}")
+        return np.clip(action, self.LOW, self.HIGH)
+
     def on_tick(self, event):
         state = np.asarray(event.robot_state.joint_positions, np.float32)
         now = time.monotonic()
@@ -171,6 +186,35 @@ class StopCell(Exception):
     """Stop the cell now: Ctrl+C, or a move that did not get where it had to."""
 
 
+class SwitchSource:
+    """One RobotRuntime action source that hands over to the policy for the phase.
+
+    RobotRuntime owns the arm and cameras and takes a single action source;
+    the cell sets `current` before each run() so pick and drop can use
+    different policies (e.g. ACT to pick, SmolVLA to sort).
+    """
+
+    def __init__(self, sources: dict):
+        self.sources = sources
+        self.current = next(iter(sources.values()))
+
+    def use(self, name: str):
+        self.current = self.sources[name]
+
+    def connect(self, *, bus, session_id):
+        self.current.connect(bus=bus, session_id=session_id)
+
+    def update(self, robot_state, camera_frames, step):
+        return self.current.update(robot_state, camera_frames, step)
+
+    def disconnect(self):
+        self.current.disconnect()
+
+    @property
+    def action_queue(self):
+        return self.current.action_queue
+
+
 class KeepOpen:
     """Passes everything to the inference model except close().
 
@@ -191,7 +235,7 @@ class KeepOpen:
 
 class Cell:
     def __init__(self, cfg: dict, arm, cameras: dict, model, anomaly: AnomalyModel, poses: dict, log: RunLog,
-                 show: bool = False):
+                 show: bool = False, drop_model=None):
         from physicalai.runtime import AsyncExecution, PolicySource, RobotRuntime, SyncExecution
 
         self.cfg, self.arm, self.cameras, self.anomaly, self.poses, self.log = cfg, arm, cameras, anomaly, poses, log
@@ -201,9 +245,15 @@ class Cell:
                    if p not in poses]
         if missing:
             raise SystemExit(f"poses missing from {cfg['poses']}: {missing}; record them with python -m cell.poses record")
-        execution = AsyncExecution() if self.pcfg.get("mode") == "async" else SyncExecution()
-        self.model = model
-        self.source = PolicySource(KeepOpen(model), execution, task=self.pcfg["tasks"]["good"])
+        def source(m):
+            execution = AsyncExecution() if self.pcfg.get("mode") == "async" else SyncExecution()
+            return PolicySource(KeepOpen(m), execution, task=self.pick_task)
+
+        self.pick_task = self.pcfg["tasks"].get("pick") or self.pcfg["tasks"]["good"]
+        self.models = [model] + ([drop_model] if drop_model is not None else [])
+        pick_source = source(model)
+        self.source = SwitchSource({"pick": pick_source,
+                                    "drop": source(drop_model) if drop_model is not None else pick_source})
         self.watcher = Watcher(poses["inspect"], self.icfg["pose_tolerance"], self.icfg["still_speed"],
                                release_delta=float(self.pcfg.get("release_delta", 20.0)))
         self.runtime = RobotRuntime(robot=arm, action_source=self.source, fps=float(self.pcfg["fps"]),
@@ -226,7 +276,8 @@ class Cell:
         return verdicts[len(verdicts) // 2]  # median
 
     def _policy(self, phase: str, task: str, timeout: float, grip_ref: float | None = None) -> tuple[bool, float]:
-        self.source.set_task(task)
+        self.source.use(phase)
+        self.source.current.set_task(task)
         self.watcher.begin(phase, grip_ref)
         t0 = time.monotonic()
         self.runtime.run(duration_s=timeout, stop_event=self.stop_event)
@@ -266,7 +317,7 @@ class Cell:
 
         for attempt in range(int(self.icfg.get("max_regrasps", 0)) + 1):
             c.regrasps = attempt
-            reached, c.pick_s = self._policy("pick", self.pcfg["tasks"]["good"], float(self.pcfg["pick_timeout_s"]))
+            reached, c.pick_s = self._policy("pick", self.pick_task, float(self.pcfg["pick_timeout_s"]))
             if not reached:
                 c.outcome, c.note = "pick_timeout", f"no inspect pose after {c.pick_s:.0f}s"
                 c.home_s = self._move(self.poses["home"])
@@ -347,16 +398,55 @@ def check_cameras(export_dir: Path, cameras: list[str]):
                          f"set studio.cameras in station.yaml to the training cameras")
 
 
-def build_real(cfg: dict):
+def load_policy(export_dir: Path, cfg: dict, role: str = "pick"):
+    """InferenceModel on the configured device, falling back to FP32 if FP16 gives NaN.
+
+    OpenVINO runs GPU models in FP16 by default. A joint that never moved in
+    the demos has a standard deviation of ~0, and its normalization then
+    divides by zero in FP16 (all-NaN actions). policy.precision: auto probes
+    once and reloads in FP32 (about 2x slower) only when needed.
+    """
+    import json as _json
+
     from physicalai.inference import InferenceModel
 
+    device, precision = cfg["policy"]["device"], str(cfg["policy"].get("precision", "auto")).lower()
+    kwargs = {"INFERENCE_PRECISION_HINT": "f32"} if precision == "f32" else {}
+    model = InferenceModel(export_dir, device=device, **kwargs)
+    if precision == "auto" and device.upper() != "CPU":
+        manifest = _json.loads((Path(export_dir) / "manifest.json").read_text())
+        obs = {}
+        for f in manifest["model"]["input_features"]:
+            a = f.get("init_args", f)
+            name, shape = a["name"], a["shape"]
+            if a.get("ftype") == "VISUAL":
+                c, h, w = shape
+                obs[name] = np.zeros((1, h, w, c), np.uint8)
+            elif a.get("ftype") == "STATE":
+                obs[name] = np.zeros((1, *shape), np.float32)
+        obs["task"] = [cfg["policy"]["tasks"]["good"]]
+        if not np.all(np.isfinite(model.predict_action_chunk(obs))):
+            print(f"{role} policy gives NaN in FP16 on {device} (a joint that never moves in the demos?); using FP32")
+            model.close()
+            model = InferenceModel(export_dir, device=device, INFERENCE_PRECISION_HINT="f32")
+        else:
+            model.reset()
+    print(f"{role} policy: {export_dir} on {device}")
+    return model
+
+
+def build_real(cfg: dict):
     from cell.hardware import build_arm, build_cameras
 
-    export_dir = studio.resolve_policy_dir(cfg["policy"]["model"], cfg["studio"]["db"])
-    check_cameras(export_dir, cfg["studio"]["cameras"])
-    print(f"policy: {export_dir} on {cfg['policy']['device']}")
-    model = InferenceModel(export_dir, device=cfg["policy"]["device"])
-    return build_arm(cfg), build_cameras(cfg), model
+    def load(spec, role):
+        export_dir = studio.resolve_policy_dir(spec, cfg["studio"]["db"])
+        check_cameras(export_dir, cfg["studio"]["cameras"])
+        return load_policy(export_dir, cfg, role)
+
+    model = load(cfg["policy"]["model"], "pick")
+    drop = cfg["policy"].get("drop_model")
+    drop_model = load(drop, "drop") if drop else None
+    return build_arm(cfg), build_cameras(cfg), model, drop_model
 
 
 def build_mock(cfg: dict, poses: dict, images: str | None, miss_every: int):
@@ -367,7 +457,7 @@ def build_mock(cfg: dict, poses: dict, images: str | None, miss_every: int):
     insp = cfg["inspection"]["camera"]
     cams[insp] = MockInspectionCamera(insp, images, arm, poses["inspect"], cfg["inspection"]["pose_tolerance"],
                                       miss_every=miss_every)
-    return arm, cams, MockPolicy(poses, cfg["policy"]["tasks"], fps=float(cfg["policy"]["fps"]))
+    return arm, cams, MockPolicy(poses, cfg["policy"]["tasks"], fps=float(cfg["policy"]["fps"])), None
 
 
 MOCK_POSES = {
@@ -389,6 +479,7 @@ def main():
     ap.add_argument("--mock", action="store_true", help="no hardware: mock arm, cameras and policy")
     ap.add_argument("--mock-images", help="folder with good/ and defective/ crops for the mock inspection camera")
     ap.add_argument("--mock-miss-every", type=int, default=0, help="mock: every n-th pick grabs nothing")
+    ap.add_argument("--mock-policy", help="mock: drive the mock arm with this exported policy instead of the scripted one")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -402,23 +493,27 @@ def main():
     poses = poses_mod.load(cfg["poses"])
     if args.mock:
         poses = {k: np.asarray(v, np.float32) for k, v in MOCK_POSES.items()} | poses
-        arm, cameras, model = build_mock(cfg, poses, args.mock_images, args.mock_miss_every)
+        arm, cameras, model, drop_model = build_mock(cfg, poses, args.mock_images, args.mock_miss_every)
+        if args.mock_policy:  # real exported policy (InferenceModel) driving the mock arm
+            check_cameras(Path(args.mock_policy), cfg["studio"]["cameras"])
+            model = load_policy(Path(args.mock_policy), cfg)
     else:
-        arm, cameras, model = build_real(cfg)
+        arm, cameras, model, drop_model = build_real(cfg)
     anomaly = AnomalyModel(cfg["inspection"]["model"], cfg["inspection"]["device"])
     print(f"inspection: {cfg['inspection']['model']} on {anomaly.device}, threshold {anomaly.threshold:.3f}")
 
     log = RunLog(cfg["runs_dir"], cfg)
-    cell = Cell(cfg, arm, cameras, model, anomaly, poses, log, show=args.show)
+    cell = Cell(cfg, arm, cameras, model, anomaly, poses, log, show=args.show, drop_model=drop_model)
     try:
         cell.run(args.cycles)
     except KeyboardInterrupt:
         cell.stop_event.set()
         print("\nstopped")
     finally:
-        close = getattr(model, "close", None)
-        if close is not None:
-            close()
+        for m in cell.models:
+            close = getattr(m, "close", None)
+            if close is not None:
+                close()
         print(log.summary())
 
 
