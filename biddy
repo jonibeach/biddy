@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# One entry point for the whole cell. Every step runs in the right venv:
+# the Studio venv (physicalai, LeRobot, OpenVINO) or anomaly/.venv (Anomalib).
+#
+#   ./biddy setup                 create anomaly/.venv; check Studio, devices, cameras
+#   ./biddy devices               OpenVINO devices (CPU GPU NPU)
+#   ./biddy status                Studio datasets, trainers, jobs, models
+#   ./biddy check [dataset]       sanity-check recorded demos (default: latest)
+#   ./biddy poses record|show|goto <name>
+#   ./biddy roi <image>|--camera  pick the inspection crop box
+#   ./biddy anomaly [dataset]     extract crops from demos -> train -> INT8 -> benchmark
+#   ./biddy train-policy [args]   train in Studio and wait (e.g. --policy smolvla --name v1)
+#   ./biddy bench                 time policy and anomaly models on CPU/GPU/NPU
+#   ./biddy mock [args]           whole loop with mock arm/cameras/policy
+#   ./biddy run [args]            the real cell (e.g. --cycles 10 --show)
+#   ./biddy prepare [dataset]     check + anomaly + bench: everything after recording
+#
+# Extra arguments go to the underlying tool; each has --help.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+STUDIO_PY="${STUDIO_PY:-$HOME/physical-ai-studio/application/backend/.venv/bin/python}"
+ANOMALY_PY="anomaly/.venv/bin/python"
+UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
+# Settings the cell reads; override with BIDDY_CONFIG=other.yaml ./biddy ...
+CONFIG="${BIDDY_CONFIG:-station.yaml}"
+
+die() { echo "biddy: $*" >&2; exit 1; }
+need_studio_py() { [ -x "$STUDIO_PY" ] || die "Studio venv not found at $STUDIO_PY (set STUDIO_PY)"; }
+need_anomaly_py() { [ -x "$ANOMALY_PY" ] || die "anomaly venv missing: run ./biddy setup"; }
+cfg() { "$STUDIO_PY" -c "import yaml,sys; c=yaml.safe_load(open('$CONFIG')); print(eval(sys.argv[1], {}, {'c': c}))" "$1"; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  setup)
+    need_studio_py
+    "$UV" sync --project anomaly
+    echo "--- devices";  "$STUDIO_PY" -m cell.intel
+    echo "--- studio";   "$STUDIO_PY" -m cell.studio --config "$CONFIG"
+    ;;
+  devices) need_studio_py; "$STUDIO_PY" -m cell.intel ;;
+  status)  need_studio_py; "$STUDIO_PY" -m cell.train_policy --config "$CONFIG" --list ;;
+  check)   need_studio_py; "$STUDIO_PY" scripts/check_dataset.py "${1:-latest}" --config "$CONFIG" "${@:2}" ;;
+  poses)   need_studio_py; "$STUDIO_PY" -m cell.poses --config "$CONFIG" "$@" ;;
+  roi)     need_studio_py; "$STUDIO_PY" anomaly/roi.py --config "$CONFIG" "$@" ;;
+  extract) need_studio_py; "$STUDIO_PY" anomaly/extract.py "${1:-latest}" --config "$CONFIG" "${@:2}" ;;
+  train-anomaly)
+    need_anomaly_py
+    out="$(cfg "c['inspection']['model']")"; out="${out%-int8}"
+    "$ANOMALY_PY" anomaly/train.py --data data/anomaly --out "$out" --int8 "$@"
+    ;;
+  anomaly)
+    need_studio_py; need_anomaly_py
+    "$STUDIO_PY" anomaly/extract.py "${1:-latest}" --config "$CONFIG"
+    "$0" train-anomaly
+    "$0" bench --policy
+    ;;
+  train-policy) need_studio_py; "$STUDIO_PY" -m cell.train_policy --config "$CONFIG" "$@" ;;
+  bench)   need_studio_py; "$STUDIO_PY" -m cell.bench --config "$CONFIG" "$@" ;;
+  mock)
+    need_studio_py
+    imgs=(); [ -d data/anomaly ] && imgs=(--mock-images data/anomaly)
+    "$STUDIO_PY" -m cell.run --config "$CONFIG" --mock "${imgs[@]}" "$@"
+    ;;
+  run)     need_studio_py; "$STUDIO_PY" -m cell.run --config "$CONFIG" "$@" ;;
+  prepare)
+    "$0" check "${1:-latest}"
+    "$0" anomaly "${1:-latest}"
+    ;;
+  help|-h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0" ;;
+  *) die "unknown command '$cmd' (./biddy help)" ;;
+esac
