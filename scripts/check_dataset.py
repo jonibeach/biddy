@@ -20,7 +20,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cell import poses as poses_mod  # noqa: E402
 from cell.dataset import Dataset, resolve  # noqa: E402
-from cell.inspection import INSPECTION, WRIST, find_holds, view_crop  # noqa: E402
+from cell.inspection import episode_crops, find_holds, split_views  # noqa: E402
 
 
 def main():
@@ -43,8 +43,8 @@ def main():
 
     home = poses_mod.load(cfg["poses"]).get("home")
     insp = cfg["inspection"]
-    view = insp["views"][INSPECTION]
-    expected = int(cfg.get("scripted", {}).get("after_holds", 4))
+    insp_views, hover_view = split_views(insp["views"])
+    expected = int(insp.get("holds_per_brick", 4))
     lengths = np.array([e.seconds for e in eps])
     med = float(np.median(lengths)) if len(eps) else 0.0
     flagged = []
@@ -54,10 +54,10 @@ def main():
         g = e.state[:, 5]
         grip_range = float(g.max() - g.min())
         jump = float(np.abs(np.diff(e.action, axis=0)).max()) if len(e.action) > 1 else 0.0
-        holds = find_holds(e.state, e.fps, lambda i, e=e: view_crop(ds.frame(int(e.global_index[i]), view["camera"]), view),
-                           insp, home)
-        n_insp = sum(h.kind == INSPECTION for h in holds)
-        n_wrist = sum(h.kind == WRIST for h in holds)
+        holds = find_holds(e.state, e.fps, episode_crops(ds, e, insp["views"], insp_views), insp, hover_view, home)
+        n_insp = sum(h.kind != hover_view for h in holds)
+        n_wrist = sum(h.kind == hover_view for h in holds)
+        per_view = Counter(h.kind for h in holds if h.kind != hover_view)
         if e.seconds < 0.5 * med:
             flags.append("short")
         if e.seconds > 2.0 * med:
@@ -68,14 +68,34 @@ def main():
             flags.append(f"action jump {jump:.0f}")
         if n_insp < expected:
             flags.append(f"{n_insp} inspection holds, protocol has {expected}")
-        if n_wrist == 0:
+        if hover_view and n_wrist == 0:
             flags.append("no hover hold before the grasp")
+        for v in insp_views:
+            if per_view[v] == 0:
+                flags.append(f"brick never at the {v} spot")
         if "|" in e.task:
             flags.append("several tasks in one episode")
         if flags:
             flagged.append(e.index)
         print(f"{e.index:>4} {e.seconds:>6.1f} {g.min():>5.0f}-{g.max():<5.0f} {jump:>5.0f} {n_wrist:>2}+{n_insp:<3}  "
               f"{e.task}{'  <-- ' + ', '.join(flags) if flags else ''}")
+
+    # Task text like "put the white brick in the good bowl" names the colour:
+    # the anomaly model needs clean examples of every colour (and defective
+    # ones to check its threshold), so show the balance.
+    import re
+
+    def colour(task: str) -> str:
+        m = re.search(r"the (.+?) brick", task)
+        return m.group(1) if m else "(unnamed)"
+
+    table = Counter((colour(e.task), "defective" if "defective" in e.task else "good") for e in eps)
+    colours = sorted({c for c, _ in table})
+    print("\nepisodes per colour:   good  defective")
+    for c in colours:
+        g, d = table[(c, "good")], table[(c, "defective")]
+        warn = "  <-- no defective demos" if d == 0 else ("  <-- few good demos" if g < 5 else "")
+        print(f"  {c:20} {g:5} {d:10}{warn}")
 
     print("\ntasks:")
     for task, n in Counter(e.task for e in eps).most_common():
@@ -93,7 +113,7 @@ def main():
                 print(f"note: {name} barely moves in the demos (std {std:.2f}); the policy may give NaN in FP16 "
                       "on the GPU. The cell falls back to FP32 automatically (policy.precision: auto).")
     print(f"\nlength median {med:.1f}s; flagged {len(flagged)}: {flagged}")
-    print("(holds: wrist hover + inspection holds; set inspection.views.inspection.roi for reliable detection)")
+    print(f"(holds: hover + inspection holds over views {insp_views}; set each view's roi for reliable detection)")
 
 
 if __name__ == "__main__":

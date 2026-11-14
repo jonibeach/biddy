@@ -170,73 +170,134 @@ class MockCamera:
         self.disconnect()
 
 
-class MockInspectionCamera(MockCamera):
-    """Shows the current brick image only while the arm is at the inspect pose.
+# The mock policy's route, following docs/data_collection.md (normalized units).
+MOCK_POSES = {
+    "home": [0, -90, 90, 60, 0, 60],
+    "hover": [10, -40, 60, 40, 0, 60],
+    "inspect_back": [30, -20, 30, 10, 0, 5],
+    "inspect_bottom": [30, -20, 30, 45, 0, 5],
+    "regrasp": [-10, -30, 50, 40, 0, 5],
+    "inspect_side1": [30, -20, 30, 10, -60, 5],
+    "inspect_side2": [30, -20, 30, 10, 60, 5],
+    "good_bowl": [-50, -10, 20, 30, 0, 5],
+    "defective_bowl": [60, -10, 20, 30, 0, 5],
+}
+FACES = {"inspect_back": "back", "inspect_bottom": "bottom", "inspect_side1": "side1", "inspect_side2": "side2"}
 
-    Away from it the camera sees the empty background, like the real station,
-    so the cell's brick-presence check and re-grasp path can be exercised.
-    `miss_every` makes every n-th pick come up empty (a failed grasp).
+
+class MockStation:
+    """The table, the brick and what each camera sees, driven by the mock arm's pose.
+
+    Each brick is good or has a mark on one face (back, bottom, side1, side2
+    or top). The inspection camera shows the face for the inspection pose the
+    arm is at; the wrist camera shows the top face during the hover. Images are
+    drawn in the same style as the synthetic test dataset, inside each view's
+    ROI, so models trained on that dataset can judge them. `miss_every` makes
+    every n-th brick's first grasp come up empty.
     """
 
-    def __init__(self, name, folder, arm, inspect_pose, tolerance=10.0, miss_every=0, **kw):
-        super().__init__(name, folder, **kw)
-        self.arm, self.inspect_pose, self.tolerance = arm, np.asarray(inspect_pose, np.float32), tolerance
-        self.miss_every = miss_every
-        self.picks = 0
-        self.background = np.full((self.height, self.width, 3), 60, np.uint8)
+    COLORS = {"back": (200, 40, 40), "bottom": (190, 50, 50), "side1": (205, 35, 45),
+              "side2": (195, 45, 35), "top": (200, 40, 40)}
 
-    def advance(self):
-        super().advance()
-        self.picks = getattr(self, "picks", 0) + 1
-        self.retried = False
+    def __init__(self, arm, poses: dict, views: dict, miss_every: int = 0, seed: int = 0):
+        self.arm, self.views, self.miss_every = arm, views, miss_every
+        self.poses = {k: np.asarray(v, np.float32) for k, v in poses.items()}
+        self.rng = np.random.default_rng(seed)
+        self.bricks = 0
+        self.defect: str | None = None
+        self.missed = False
+
+    def next_brick(self) -> str:
+        self.bricks += 1
+        self.defect = str(self.rng.choice(["back", "bottom", "side1", "side2", "top"])) if self.rng.random() < 0.5 else None
+        self.missed = bool(self.miss_every) and self.bricks % self.miss_every == 0
+        return "defective" if self.defect else "good"
 
     def regrasp(self):
-        """The cell is picking again after a miss: this time the grasp works."""
-        self.retried = True
+        self.missed = False
+
+    def _at(self, name: str) -> bool:
+        return float(np.max(np.abs(self.arm._pos[:5] - self.poses[name][:5]))) <= 3.0
+
+    def _noise(self, img: np.ndarray) -> np.ndarray:
+        return cv2.add(img, self.rng.integers(0, 12, img.shape, dtype=np.uint8))
+
+    def image(self, view: str) -> np.ndarray:
+        if view == "wrist":
+            img = np.full((480, 640, 3), 110, np.uint8)
+            if self._at("hover") and self.bricks:
+                cv2.rectangle(img, (280, 300), (360, 380), self.COLORS["top"], -1)
+                if self.defect == "top":
+                    cv2.circle(img, (320, 340), 12, (0, 0, 0), -1)
+            return self._noise(img)
+        img = np.full((480, 640, 3), 60, np.uint8)
+        face = next((f for pose, f in FACES.items() if self._at(pose)), None)
+        if face and self.bricks and not self.missed:
+            # Like the station: the bottom is shown at the bottom right, the other faces in the centre.
+            x, y = (470, 330) if face == "bottom" else (260, 180)
+            cv2.rectangle(img, (x, y), (x + 120, y + 120), self.COLORS[face], -1)
+            if self.defect == face:
+                cv2.line(img, (x + 10, y + 10), (x + 110, y + 110), (0, 0, 0), 5)
+        return self._noise(img)
+
+    def camera(self, view: str) -> "MockViewCamera":
+        return MockViewCamera(self, view)
+
+
+class MockViewCamera(MockCamera):
+    def __init__(self, station: MockStation, view: str):
+        super().__init__(view)
+        self.station, self.view = station, view
 
     def read_latest(self) -> MockFrame:
         self._seq += 1
-        pos = self.arm._pos  # no get_observation(): that would advance the mock servo
-        at_inspect = float(np.max(np.abs(pos[:5] - self.inspect_pose[:5]))) <= self.tolerance
-        missed = self.miss_every and self.picks % self.miss_every == 0 and not getattr(self, "retried", False)
-        img = self._img if at_inspect and not missed else self.background
-        if img.shape[:2] != (self.height, self.width):
-            canvas = self.background.copy()
-            h, w = img.shape[:2]
-            y, x = (self.height - h) // 2, (self.width - w) // 2
-            canvas[y:y + h, x:x + w] = img
-            img = canvas
-        return MockFrame(img, time.monotonic(), self._seq)
+        return MockFrame(self.station.image(self.view), time.monotonic(), self._seq)
+
+    def next_brick(self) -> str:
+        return self.station.next_brick()
+
+    def regrasp(self):
+        self.station.regrasp()
 
 
 class MockPolicy:
-    """Stands in for InferenceModel: walks toward a target pose in small steps.
+    """Stands in for InferenceModel: plays one demo of the recording protocol.
 
-    Mimics a demo: go to the inspect pose with the gripper closed, pause there
-    for `hold_s`, then carry on to the bowl named by the task text and open
-    the gripper. It reads the task from the observation like a real VLA.
+    home -> hover (hold) -> grasp -> back (hold) -> bottom (hold) -> regrasp
+    -> side1 (hold) -> side2 (hold) -> the bowl named by the task -> open ->
+    home. Like a VLA it reads the task from each observation, so a task switch
+    during the holds changes the bowl. reset() (each new run) starts over.
     """
 
-    def __init__(self, poses: dict[str, np.ndarray], tasks: dict[str, str], chunk: int = 10,
-                 step: float = 4.0, hold_s: float = 1.0, fps: float = 30.0):
-        self.poses, self.tasks = poses, tasks
-        self.chunk, self.step = chunk, step
-        self.hold_steps = int(hold_s * fps)
+    HOLD_S = {"hover": 0.6, "inspect_back": 1.0, "inspect_bottom": 1.0, "inspect_side1": 1.0, "inspect_side2": 1.0,
+              "home": 0.5}
+
+    def __init__(self, poses: dict, tasks: dict[str, str], chunk: int = 10, step: float = 4.0, fps: float = 30.0):
+        self.poses = {k: np.asarray(v, np.float32) for k, v in poses.items()}
+        self.tasks, self.chunk, self.step, self.fps = tasks, chunk, step, fps
         self.reset()
 
     def reset(self):
+        self.i = 0
         self.held = 0
 
-    def _target(self, pos: np.ndarray, task: str | None) -> np.ndarray:
-        inspect = self.poses["inspect"].copy()
-        inspect[5] = 5.0  # holding the brick
-        if self.held < self.hold_steps:
-            if float(np.max(np.abs(pos[:5] - inspect[:5]))) <= 2.0:
-                self.held += 1
-            return inspect
+    def _route(self, task: str | None) -> list[tuple[str, float]]:
         bowl = "defective_bowl" if task == self.tasks["defective"] else "good_bowl"
-        target = self.poses[bowl].copy()
-        target[5] = 5.0 if float(np.max(np.abs(pos[:5] - target[:5]))) > 2.0 else 60.0
+        return [("hover", 60), ("hover", 5), ("inspect_back", 5), ("inspect_bottom", 5), ("regrasp", 5),
+                ("regrasp", 60), ("regrasp", 5), ("inspect_side1", 5), ("inspect_side2", 5), (bowl, 5),
+                (bowl, 60), ("home", 60)]
+
+    def _target(self, pos: np.ndarray, task: str | None) -> np.ndarray:
+        route = self._route(task)
+        name, grip = route[min(self.i, len(route) - 1)]
+        target = self.poses[name].copy()
+        target[5] = grip
+        if float(np.max(np.abs(pos - target))) <= 1.0 and self.i < len(route) - 1:
+            hold = int(self.HOLD_S.get(name, 0.0) * self.fps) if route[self.i + 1][0] != name else 0
+            if self.held >= hold:
+                self.i, self.held = self.i + 1, 0
+            else:
+                self.held += 1
         return target
 
     def predict_action_chunk(self, obs: dict) -> np.ndarray:

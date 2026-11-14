@@ -1,13 +1,14 @@
 """Pull labeled crops for Anomalib out of recorded demos, one folder per camera view.
 
-Every demo holds the brick in front of the inspection camera (back, bottom,
-both sides) and hovers over it first (the wrist camera sees top and front);
+Every demo holds the brick at fixed spots in front of the inspection camera
+(one view per spot in station.yaml) and hovers over it first (the wrist
+camera sees top and front);
 its task text says which bowl it went to. So the demos double as anomaly data:
 
     ~/physical-ai-studio/application/backend/.venv/bin/python anomaly/extract.py latest
 
 writes data/anomaly/<view>/good/*.png and data/anomaly/<view>/defective/*.png
-for the views in station.yaml (inspection, wrist), cropped to each view's roi.
+for every view in station.yaml (e.g. side, bottom, wrist), cropped to its roi.
 Holds are found the same way the live cell finds them (cell/inspection.py).
 
 A defective brick has its mark on one face only, so most crops under
@@ -26,7 +27,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cell import poses as poses_mod  # noqa: E402
 from cell.dataset import Dataset, resolve  # noqa: E402
-from cell.inspection import INSPECTION, find_holds, view_crop  # noqa: E402
+from cell.inspection import episode_crops, find_holds, split_views  # noqa: E402
 
 PREFIX = "ds_"  # extracted files start with this, so a re-run only replaces its own
 
@@ -49,6 +50,7 @@ def main():
     for name, v in views.items():
         if v.get("roi") is None and not args.no_crop:
             print(f"note: {name} roi is not set; saving full frames. Set it with ./biddy roi --view {name}, then re-run.")
+    insp_views, hover_view = split_views(views)
     root = resolve(args.dataset, cfg["studio"]["db"])
     ds = Dataset(root)
     home = poses_mod.load(cfg["poses"]).get("home")
@@ -68,18 +70,16 @@ def main():
             continue
         label = "defective" if args.defect_word in ep.task.lower() else "good"
 
-        def frame(view: str, i: int):
-            return view_crop(ds.frame(int(ep.global_index[i]), views[view]["camera"]), views[view])
-
-        holds = find_holds(ep.state, ep.fps, lambda i: frame(INSPECTION, i), insp, home)
-        if not any(h.kind == INSPECTION for h in holds):
+        insp_crops = episode_crops(ds, ep, views, insp_views)
+        holds = find_holds(ep.state, ep.fps, insp_crops, insp, hover_view, home)
+        if not any(h.kind != hover_view for h in holds):
             skipped.append((ep.index, "no inspection hold found"))
             continue
         for h_i, hold in enumerate(holds):
             if hold.kind not in views:
                 continue
             for i in hold.frames(args.per_hold):
-                rgb = frame(hold.kind, int(i))
+                rgb = episode_crops(ds, ep, views, [hold.kind])(int(i))[hold.kind]
                 name = f"{PREFIX}{root.name[:8]}_ep{ep.index:04d}_h{h_i}_f{int(i):05d}.png"
                 cv2.imwrite(str(args.out / hold.kind / label / name), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
                 counts[(hold.kind, label)] = counts.get((hold.kind, label), 0) + 1

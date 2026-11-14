@@ -31,6 +31,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cell.anomaly import AnomalyModel  # noqa: E402
 
+AUG_PREFIX = "aug_"  # augmented copies of good crops (augment_good)
+
 MODELS = {
     "patchcore": ("anomalib.models", "Patchcore"),
     "padim": ("anomalib.models", "Padim"),
@@ -38,11 +40,12 @@ MODELS = {
 }
 
 
-def build_model(name: str):
+def build_model(name: str, coreset: float):
     import importlib
 
     module, cls = MODELS[name]
-    return getattr(importlib.import_module(module), cls)()
+    kwargs = {"coreset_sampling_ratio": coreset} if name == "patchcore" else {}
+    return getattr(importlib.import_module(module), cls)(**kwargs)
 
 
 def heldout_images(datamodule) -> list[tuple[str, int]]:
@@ -50,7 +53,9 @@ def heldout_images(datamodule) -> list[tuple[str, int]]:
     seen = {}
     for ds in (datamodule.val_data, datamodule.test_data):
         for _, row in ds.samples.iterrows():
-            seen[str(row["image_path"])] = int(row["label_index"])
+            path = str(row["image_path"])
+            if not Path(path).name.startswith(AUG_PREFIX):  # copies of training crops would flatter the threshold
+                seen[path] = int(row["label_index"])
     return sorted(seen.items())
 
 
@@ -97,6 +102,32 @@ def pick_threshold(scores) -> tuple[float, str]:
     return best, f"scores overlap; {errors}/{len(scores)} held-out images misclassified at {best:.3f}"
 
 
+
+def augment_good(good_dir: Path, copies: int):
+    """Add rotated/flipped copies of the good crops, so a brick held at another
+    orientation does not look anomalous. Patchcore has no rotation invariance
+    of its own; it only knows the orientations it was shown.
+
+    Copies are named aug_* and rebuilt on every run. Only good crops are
+    augmented, never the held-out defective ones.
+    """
+    for old in good_dir.glob(f"{AUG_PREFIX}*.png"):
+        old.unlink()
+    ops = [lambda im: cv2.rotate(im, cv2.ROTATE_180), lambda im: cv2.flip(im, 1),
+           lambda im: cv2.rotate(im, cv2.ROTATE_90_CLOCKWISE), lambda im: cv2.rotate(im, cv2.ROTATE_90_COUNTERCLOCKWISE),
+           lambda im: cv2.flip(im, 0), lambda im: cv2.transpose(im), lambda im: cv2.flip(cv2.transpose(im), -1)]
+    originals = sorted(p for p in good_dir.glob("*.png") if not p.name.startswith(AUG_PREFIX))
+    for path in originals:
+        img = cv2.imread(str(path))
+        for k, op in enumerate(ops[:copies]):
+            out = op(img)
+            if out.shape[:2] != img.shape[:2]:  # 90-degree turns of a non-square crop: keep the crop's size
+                out = cv2.resize(out, (img.shape[1], img.shape[0]))
+            cv2.imwrite(str(good_dir / f"{AUG_PREFIX}{k}_{path.name}"), out)
+    if copies:
+        print(f"augmented {len(originals)} good crops x{copies} (rotations/flips)")
+
+
 def trainer_device(choice: str) -> dict:
     """Lightning accelerator/strategy for the Intel GPU (XPU), or the CPU."""
     import torch
@@ -139,6 +170,11 @@ def main():
     ap.add_argument("--size", type=int, default=256, help="square model input size")
     ap.add_argument("--epochs", type=int, default=1, help="Patchcore/Padim need 1; EfficientAd ~ 20+")
     ap.add_argument("--int8", action="store_true", help="also export an NNCF INT8 model")
+    ap.add_argument("--coreset", type=float, default=0.01,
+                    help="Patchcore memory bank as a fraction of all patches. Its greedy selection is the slow "
+                         "part (it grows with images x patches); 0.01 keeps hundreds of crops to minutes on the CPU")
+    ap.add_argument("--augment", type=int, default=1, choices=[0, 1, 3, 7],
+                    help="extra rotated/flipped copies of each good crop (bricks in different orientations); 0 = off")
     ap.add_argument("--accelerator", default="cpu", choices=["cpu", "xpu"],
                     help="cpu (default) or xpu (Intel GPU; experimental: Patchcore training currently "
                          "triggers an xe driver page fault on this laptop)")
@@ -149,7 +185,8 @@ def main():
     from anomalib.engine import Engine
 
     good_dir, bad_dir = args.data / "good", args.data / "defective"
-    n_good = len(list(good_dir.glob("*.png")))
+    augment_good(good_dir, args.augment)
+    n_good = len([p for p in good_dir.glob("*.png") if not p.name.startswith(AUG_PREFIX)])
     n_bad = len(list(bad_dir.glob("*.png"))) if bad_dir.exists() else 0
     if n_good < 5:
         sys.exit(f"need at least 5 images in {good_dir}, found {n_good}")
@@ -168,7 +205,7 @@ def main():
         )
 
     dm = datamodule(1 if args.model == "efficient_ad" else 8)  # EfficientAd requires batch size 1
-    model = build_model(args.model)
+    model = build_model(args.model, args.coreset)
     work = args.out.parent / f".{args.out.name}-work"
     engine = Engine(max_epochs=args.epochs, default_root_dir=work, **trainer_device(args.accelerator))
     engine.fit(model=model, datamodule=dm)

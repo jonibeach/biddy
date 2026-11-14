@@ -32,8 +32,8 @@ policy:
   #                inspect, drop, home); the cell scores every hold on the fly
   #                and switches the task to the defective bowl as soon as a
   #                face fails, which is before the drop.
-  #   scripted:    the policy stops after `scripted.after_holds` inspection
-  #                holds and the arm replays the recorded bowl pose.
+  #   scripted:    the policy stops after inspection.holds_per_brick holds
+  #                and the arm replays the recorded bowl pose.
   drop: task_switch
   episode_timeout_s: 60    # one brick, home to home; the demos take 30-40 s
 
@@ -41,35 +41,49 @@ inspection:
   # Policy on the GPU, inspection on the NPU, control loop on the CPU: the
   # models never compete for one accelerator. `./biddy bench` compares devices.
   device: NPU
-  # One Anomalib model per camera view. The inspection camera sees back,
-  # bottom and both sides; the wrist camera sees top and front during the
-  # hover before the grasp. A view is used when its model folder exists.
-  # roi: [x, y, w, h] in the 640x480 image (./biddy roi --view <view> <image>).
+  # One Anomalib model per view: a crop box on a camera. The brick is held at
+  # fixed spots in the inspection image, one view per spot: the sides in the
+  # centre, the bottom (tubes) at the bottom right. The hover view is the wrist
+  # camera before the grasp (top and front faces). A view is used when its
+  # model folder exists. roi: [x, y, w, h] in the 640x480 image; set it with
+  # ./biddy roi --view <view> <image>.
   views:
-    inspection:
+    side:            # centre of the inspection image; set from the demos with scripts/find_spots.py
       camera: inspection
-      roi: null
-      model: models/inspection-int8
-    wrist:
+      roi: [280, 160, 360, 270]
+      model: models/side-int8
+      poses:         # arm poses (5 body joints) at which demos show this spot
+        - [-23.0, -98.4, 98.0, 6.8, -0.7]
+        - [5.2, -98.5, 98.0, 4.3, 2.3]
+    bottom:          # bottom of the inspection image, brick tilted to show its tubes
+      camera: inspection
+      roi: [260, 280, 240, 200]
+      model: models/bottom-int8
+      poses:
+        - [2.2, -17.6, -24.5, 98.4, -1.4]
+        - [9.0, -30.0, -10.0, 90.0, 3.0]
+    wrist:           # brick between the jaw tips
       camera: wrist
-      roi: null
+      roi: [200, 60, 240, 240]
       model: models/wrist-int8
+      hover: true
   # A hold: the arm still (joint speed below still_speed, units/s) for at least
   # hold_min_s, away from home (any body joint further than home_tolerance).
   still_speed: 15.0
   hold_min_s: 0.3
   home_tolerance: 8.0
+  pose_tolerance: 10.0     # a hold is at a view's pose when every body joint is this close
   # The brick is at the inspection camera when its crop differs from the empty
   # view (grabbed at home) by at least presence_diff (mean pixel difference).
   presence_diff: 12.0
   frames: 3                # frames scored per hold; the median counts
+  holds_per_brick: 4       # inspection holds per demo: back, bottom, side, side
   # A brick whose run ends with no inspection hold was not grasped: pick again.
   max_regrasps: 2
   # Verdicts this close to a threshold are logged as uncertain.
   uncertain_margin: 0.05
 
 scripted:
-  after_holds: 4           # back, bottom, side, side
   speed: 80.0              # units/s for scripted moves
   gripper_open: 60.0       # gripper value that releases the brick
 

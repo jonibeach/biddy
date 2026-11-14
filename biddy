@@ -70,8 +70,7 @@ case "$cmd" in
   bench)   need_studio_py; "$STUDIO_PY" -m cell.bench --config "$CONFIG" "$@" ;;
   mock)
     need_studio_py
-    imgs=(); [ -d data/anomaly/inspection ] && imgs=(--mock-images data/anomaly)
-    "$STUDIO_PY" -m cell.run --config "$CONFIG" --mock "${imgs[@]}" "$@"
+    "$STUDIO_PY" -m cell.run --config "$CONFIG" --mock "$@"
     ;;
   run)     need_studio_py; "$STUDIO_PY" -m cell.run --config "$CONFIG" "$@" ;;
   prepare)
