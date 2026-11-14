@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "physical-ai-studio",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["scripts/studio.sh"],
+      "port": 7860
+    }
+  ]
+}

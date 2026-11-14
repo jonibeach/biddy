@@ -22,15 +22,49 @@ import numpy as np
 from make_tags import ASSIGNMENTS
 
 TOLERANCE_PX = 8.0  # allowed center shift before a tag counts as moved
+WIDTH, HEIGHT = 1920, 1080  # requested capture size; the camera may give less
+WARMUP_FRAMES = 15  # let auto-exposure settle before detecting
+DETECT_FRAMES = 10  # a tag counts as visible if any of these frames shows it
 
 
-def detect(frame, detector):
-    corners, ids, _ = detector.detectMarkers(frame)
-    found = {}
-    if ids is not None:
-        for c, i in zip(corners, ids.flatten()):
-            found[int(i)] = c.reshape(4, 2).mean(axis=0).tolist()
-    return found
+def make_detector():
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    params = cv2.aruco.DetectorParameters()
+    # Wider threshold windows and a lower constant than the defaults: tags with
+    # tape on the white margin or glare on the table are otherwise missed.
+    params.adaptiveThreshWinSizeMin = 5
+    params.adaptiveThreshWinSizeMax = 85
+    params.adaptiveThreshWinSizeStep = 8
+    params.adaptiveThreshConstant = 3
+    return cv2.aruco.ArucoDetector(dictionary, params)
+
+
+def detect(frames, detector):
+    """Median center per tag over all frames in which it was detected."""
+    seen = {}
+    for frame in frames:
+        corners, ids, _ = detector.detectMarkers(frame)
+        if ids is not None:
+            for c, i in zip(corners, ids.flatten()):
+                seen.setdefault(int(i), []).append(c.reshape(4, 2).mean(axis=0))
+    return {i: np.median(np.array(pts), axis=0).tolist() for i, pts in seen.items()}
+
+
+def grab(camera):
+    cap = cv2.VideoCapture(camera)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+    frames = []
+    for _ in range(WARMUP_FRAMES + DETECT_FRAMES):
+        ok, frame = cap.read()
+        if ok:
+            frames.append(frame)
+    cap.release()
+    frames = frames[WARMUP_FRAMES:]
+    if not frames:
+        raise SystemExit(f"No frame from camera {camera}")
+    return frames
 
 
 def main():
@@ -43,17 +77,11 @@ def main():
     REF_FILE = Path(__file__).with_name(f"reference_{args.name}.json")
 
     if args.image:
-        frame = cv2.imdecode(np.fromfile(args.image, np.uint8), cv2.IMREAD_COLOR)
+        frames = [cv2.imdecode(np.fromfile(args.image, np.uint8), cv2.IMREAD_COLOR)]
     else:
-        cap = cv2.VideoCapture(args.camera)
-        ok, frame = cap.read()
-        cap.release()
-        if not ok:
-            raise SystemExit(f"No frame from camera {args.camera}")
+        frames = grab(args.camera)
 
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-    detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
-    found = detect(frame, detector)
+    found = detect(frames, make_detector())
 
     print("Visible tags by object:")
     for name in sorted(set(ASSIGNMENTS.values())):
