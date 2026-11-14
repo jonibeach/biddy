@@ -13,3 +13,6 @@ wheels/
 /data/
 /models/
 /runs/
+
+# Modal trainer URL with its secret path
+/cloud/.trainer_url
