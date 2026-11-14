@@ -128,7 +128,7 @@ def main():
             seed=0,  # same held-out split every time
         )
 
-    dm = datamodule(8)
+    dm = datamodule(1 if args.model == "efficient_ad" else 8)  # EfficientAd requires batch size 1
     model = build_model(args.model)
     work = args.out.parent / f".{args.out.name}-work"
     engine = Engine(max_epochs=args.epochs, default_root_dir=work, accelerator=args.accelerator)
