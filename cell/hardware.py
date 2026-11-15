@@ -32,6 +32,68 @@ def build_arm(cfg: dict):
                  role="follower", unit=rec.unit)
 
 
+class ReconnectingCamera:
+    """A camera that reopens itself when its reads fail, instead of ending the run.
+
+    The USB cameras on this station drop out now and then for a few seconds
+    (the device stays listed); RobotRuntime gives up after 3 s of failed reads.
+    Here a failed read returns the last good frame and, at most every
+    `retry_s`, closes and reopens the device. Only a camera that never
+    delivered a frame raises.
+    """
+
+    def __init__(self, camera, name: str, retry_s: float = 1.0):
+        self._cam, self.name, self.retry_s = camera, name, retry_s
+        self._last = None
+        self._next_retry = 0.0
+        self.reconnects = 0
+
+    def __getattr__(self, item):
+        return getattr(self._cam, item)
+
+    def connect(self, *a, **k):
+        return self._cam.connect(*a, **k)
+
+    def disconnect(self, *a, **k):
+        return self._cam.disconnect(*a, **k)
+
+    def _read(self, method: str, *a, **k):
+        try:
+            frame = getattr(self._cam, method)(*a, **k)
+            self._last = frame
+            return frame
+        except Exception:  # noqa: BLE001 - CaptureError, NotConnectedError, ...
+            if self._last is None:
+                raise
+            now = time.monotonic()
+            if now >= self._next_retry:
+                self._next_retry = now + self.retry_s
+                try:
+                    self._cam.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self._cam.connect()
+                    self.reconnects += 1
+                    print(f"camera {self.name}: read failed, reopened it (#{self.reconnects})", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"camera {self.name}: reopen failed: {e}", flush=True)
+            return self._last
+
+    def read(self, *a, **k):
+        return self._read("read", *a, **k)
+
+    def read_latest(self, *a, **k):
+        return self._read("read_latest", *a, **k)
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *exc):
+        self.disconnect()
+
+
 def build_cameras(cfg: dict) -> dict:
     from physicalai.capture import RealSenseCamera, UVCCamera
 
@@ -41,7 +103,8 @@ def build_cameras(cfg: dict) -> dict:
             out[name] = RealSenseCamera(serial_number=str(rec.fingerprint["serial"]),
                                         width=rec.width, height=rec.height, fps=rec.fps)
         elif rec.driver == "usb_camera":
-            out[name] = UVCCamera(device=rec.fingerprint, width=rec.width, height=rec.height, fps=rec.fps)
+            out[name] = ReconnectingCamera(
+                UVCCamera(device=rec.fingerprint, width=rec.width, height=rec.height, fps=rec.fps), name)
         else:
             raise ValueError(f"camera {name}: driver {rec.driver!r} not supported by the cell")
     return out

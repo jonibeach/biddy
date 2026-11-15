@@ -12,23 +12,32 @@ poses: poses.json  # written by: python -m cell.poses record
 policy:
   # Which Studio model to run: "latest", "latest:<policy>" (e.g. latest:act),
   # a Studio model name, or a path to an exports/openvino folder.
-  model: latest
+  model: models/smolvla-ft-grasp55   # grasp-only policy (drop: grasp). Before: smolvla-ft-new52-from-all3 (full routine); tried: smolvla-ft-grasp107 (missed every grasp in grasp mode), smolvla-ft-new52-base (loops on the arm), smolvla-ft-all3-e2, smolvla-ft-all-e2, smolvla-ft-pislong-e3, latest
   # Optional second policy for the drop phase, e.g. ACT picks and brings the
   # brick to inspection, then SmolVLA sorts it using the verdict's task text.
   # null = the same policy does both.
   drop_model: null
   device: GPU              # OpenVINO device for the policy: CPU, GPU, NPU
   smoothing: 0.35          # EMA on the policy's actions (1 = off); the policy is jerkier than the demos
+  gripper_gain: 1.0        # off: 2.5 fed back through the gripper state (policy saw 98, opened to 100, never left home). Was: widen the policy's gripper opening (it opens ~20, demos ~35): 20 -> 42, closing (<5) unchanged
+  close_gate: false        # (tried; the shadow still fooled the policy) claw only closes with a coloured brick in the wrist camera's jaw gap (shadow-proof)
   interpolate: 3           # commands per action: 30 Hz actions -> 90 Hz smooth targets for the SO-101
   precision: auto          # auto (FP16, FP32 if FP16 gives NaN), f16, f32
   fps: 30
   mode: sync               # sync: plan each chunk from the current frame (async replayed ~140 ms stale chunks: jitter)
+                           # rtc: Real-Time Chunking (Robotics AI Suite): infer in the background, each chunk
+                           #      denoised to continue the last one; no pauses, no seams. Needs
+                           #      scripts/export_rtc.py <model>; try with ./biddy run --policy-mode rtc
+  rtc:
+    execution_horizon: 15    # fresh actions per chunk before re-planning (<= chunk/2 = 25); lower = more reactive
+    max_guidance_weight: 5.0 # how hard a new chunk is pulled onto the old tail; lower if it oscillates
   # Task text per phase; must match the task text the policies were trained on.
   # pick is optional (defaults to the good task: the pick looks the same).
   tasks:
     pick: null
     good: put the brick in the good bowl
     defective: put the brick in the defective bowl
+    grasp: pick up the brick   # drop: grasp. grasp55/grasp107 are trained on this; use the good-bowl prompt for full-routine models
   # How the brick gets into the bowl (docs/data_collection.md protocol):
   #   task_switch: the policy runs the whole demo (hover, inspect, regrasp,
   #                inspect, drop, home); the cell scores every hold on the fly
@@ -36,10 +45,20 @@ policy:
   #                face fails, which is before the drop.
   #   scripted:    the policy stops after inspection.holds_per_brick holds
   #                and the arm replays the recorded bowl pose.
-  drop: task_switch
-  episode_timeout_s: 60    # one brick, home to home; the demos take 30-40 s
+  #   grasp:       the policy only picks and lifts (tasks.grasp); a script then
+  #                shows the brick at the recorded inspection poses (same
+  #                framing every time), and drops it at the recorded bowl pose.
+  #                Needs good_bowl/defective_bowl in poses.json:
+  #                ./biddy poses record --only good_bowl defective_bowl
+  drop: grasp
+  episode_timeout_s: 120   # one brick, home to home; demos take 30-40 s, but the policy now retries grasps by itself (12 tries in one run)
 
 inspection:
+  # drop: grasp only. After the first round of poses, set the brick down at
+  # poses.regrip, roll the wrist by regrip_roll (normalized; ~50 = 90 deg),
+  # grasp again and show the faces the jaws covered. Off: one round only.
+  scripted_regrip: true    # only when every face so far passed
+  regrip_roll: 50.0
   # Policy on the GPU, inspection on the NPU, control loop on the CPU: the
   # models never compete for one accelerator. `./biddy bench` compares devices.
   device: NPU
@@ -54,7 +73,7 @@ inspection:
       camera: inspection
       crop: brick    # square around the brick found inside roi (cell/brickcrop.py); roi is the search box
       roi: [100, 100, 540, 380]
-      model: models/side-int8
+      model: models/live2/side   # live hand-loaded + policy-held crops (before: models/live/side, models/side-int8)
       poses:         # arm poses (5 body joints) at which demos show this spot
         - [-23.0, -98.4, 98.0, 6.8, -0.7]
         - [5.2, -98.5, 98.0, 4.3, 2.3]
@@ -67,17 +86,17 @@ inspection:
       camera: inspection
       crop: brick
       roi: [60, 220, 580, 260]   # wide: good demos show the bottom at the lower right, defective ones at the lower left
-      model: models/bottom-int8
+      model: models/live2/bottom   # live hand-loaded + policy-held crops (before: models/live/bottom, models/bottom-int8)
       poses:
         - [2.2, -17.6, -24.5, 98.4, -1.4]
         - [9.0, -30.0, -10.0, 90.0, 3.0]
         - [6.1, -22.0, -3.9, 73.5, 3.8]     # shallower tilt used in the defective demos
         - [8.7, -8.4, -19.9, 79.4, 7.5]
-    wrist:           # brick between the jaw tips
-      camera: wrist
-      roi: [200, 60, 240, 240]
-      model: models/wrist-int8
-      hover: true
+#    wrist:           # off: live hover framing differs from the demos, scored 1.0 on good bricks (AUROC 0.55)
+#      camera: wrist
+#      roi: [200, 60, 240, 240]
+#      model: models/wrist-int8
+#      hover: true
   # A hold: the arm still (joint speed below still_speed, units/s) for at least
   # hold_min_s, away from home (any body joint further than home_tolerance).
   still_speed: 15.0
@@ -121,7 +140,7 @@ tags:
   on_moved: pause          # pause: wait until it is put back; warn: log it and carry on
 
 scripted:
-  speed: 80.0              # units/s for scripted moves
+  speed: 45.0              # units/s for scripted moves (80 shook a brick out of the jaws)
   gripper_open: 60.0       # gripper value that releases the brick
 
 runs_dir: runs

@@ -14,6 +14,7 @@
 #   ./biddy bench                 time policy and anomaly models on CPU/GPU/NPU
 #   ./biddy mock [args]           whole loop with mock arm/cameras/policy
 #   ./biddy run [args]            the real cell (e.g. --cycles 10 --show)
+#   ./biddy debug-server          always-on debug page at http://localhost:8765
 #   ./biddy prepare [dataset]     check + anomaly + bench: everything after recording
 #
 # Extra arguments go to the underlying tool; each has --help.
@@ -77,6 +78,7 @@ case "$cmd" in
     "$STUDIO_PY" -m cell.run --config "$CONFIG" --mock "$@"
     ;;
   run)     need_studio_py; "$STUDIO_PY" -m cell.run --config "$CONFIG" "$@" ;;
+  debug-server) need_studio_py; "$STUDIO_PY" scripts/debug_server.py "$@" ;;
   prepare)
     dataset_only "$@"
     "$SELF" check "$@"

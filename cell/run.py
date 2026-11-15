@@ -71,6 +71,7 @@ class Inspector(threading.Thread):
         self.insp_views, self.hover_view = split_views(views)
         self.q: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
+        self.save_dir: Path | None = None  # --collect: data/live/<label>; each scored crop is saved
         self.reset(None, None)
         self.start()
 
@@ -93,6 +94,8 @@ class Inspector(threading.Thread):
             self.worst_crop: tuple[float, str, np.ndarray] | None = None
             self.infer_ms: list[float] = []
             self.switched = False
+            self.save_prefix = time.strftime("%H%M%S")
+            self.grip_max = 0.0  # widest gripper seen this brick: a drop from it means the grasp happened
 
     def run(self):
         while True:
@@ -117,20 +120,34 @@ class Inspector(threading.Thread):
         with self.lock:
             if self.home is None:
                 return
+            self.grip_max = max(self.grip_max, float(state[5]))
             if hold_id not in self.kinds:
                 presences = {v: presence(view_crop(frames[self.views[v]["camera"]], self.views[v]), self.backgrounds[v])
                              for v in self.insp_views}
-                seen = any(k not in (None, self.hover_view) for k in self.kinds.values())
+                # The hover (wrist camera over the brick) comes before the grasp. Once the
+                # gripper has closed well below its widest, a pause on the way to a spot
+                # is not the hover: scoring it on the wrist model once sent a good brick
+                # to the defective bowl.
+                grasped = self.grip_max - float(state[5]) > float(self.cfg.get("grasp_drop", 8.0))
+                seen = grasped or any(k not in (None, self.hover_view) for k in self.kinds.values())
                 kind = hold_kind(state, self.home, presences, seen, self.cfg, self.hover_view)
                 self.kinds[hold_id] = kind if kind in self.models else None
                 if kind in presences:
                     self.presence.append(presences[kind])
+                dist = {v: at_pose(state, self.views[v], float(self.cfg.get("pose_tolerance", 10.0)))
+                        for v in self.insp_views}
+                print(f"  hold {hold_id}: {kind or '-'}  grip {state[5]:.1f}/{self.grip_max:.1f}"
+                      f"{' grasped' if grasped else ''}  presence "
+                      + " ".join(f"{v} {p:.1f}" for v, p in presences.items())
+                      + "  pose " + " ".join(f"{v} {'-' if d is None else f'{d:.1f}'}" for v, d in dist.items())
+                      + "  joints " + " ".join(f"{x:.0f}" for x in state[:5]), flush=True)
             kind = self.kinds[hold_id]
             if kind is None:
                 return
             cam = self.views[kind]["camera"]
             rgb = score_crop(frames[cam], self.views[kind], self.empty_frames.get(cam))
             if rgb is None:  # crop: brick found no brick in this frame
+                print(f"  hold {hold_id}: {kind} - no brick found in the crop", flush=True)
                 return
         result = self.models[kind](rgb)
         with self.lock:
@@ -149,6 +166,11 @@ class Inspector(threading.Thread):
         samples = sorted(self.samples.pop(hold_id), key=lambda s: s[0])
         score, rgb = samples[len(samples) // 2]
         kind = self.kinds[hold_id]
+        if self.save_dir is not None:  # --collect: every scored crop, for retraining on live grips
+            d = self.save_dir / kind
+            d.mkdir(parents=True, exist_ok=True)
+            for i, (sc, im) in enumerate(samples):
+                cv2.imwrite(str(d / f"{self.save_prefix}_h{hold_id:02d}_{i}_{sc:.3f}.png"), cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
         self.verdict.add(kind, score)
         margin = score - self.verdict.thresholds[kind]
         if self.worst_crop is None or margin > self.worst_crop[0]:
@@ -159,6 +181,30 @@ class Inspector(threading.Thread):
 
 
 # --- watcher: RobotRuntime callback ------------------------------------------
+
+
+def brick_in_jaws(wrist_rgb: np.ndarray) -> bool:
+    """A coloured brick in the gap right of the static jaw, close enough to grasp (wrist camera, 640x480).
+
+    Measured on the day's grasps: good closes had a ~19k px brick blob centred at
+    x 290-400; misses had it left of the static jaw (x < 200, the jaw lands on it)
+    or small under the jaw tip. The claw's shadow is grey, so it never counts.
+    """
+    hsv = cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = (hsv[..., i].astype(np.int16) for i in range(3))
+    pink = ((h >= 140) | (h <= 8)) & (s > 70)
+    colour = ((((h >= 25) & (h <= 85) & (s > 50) & (v > 70))           # green
+               | ((h >= 112) & (h <= 139) & (s > 40) & (v > 90))      # lavender
+               | ((h >= 95) & (h <= 125) & (s > 110) & (v > 60)))     # blue
+              & ~pink)
+    mask = cv2.morphologyEx(colour.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
+    sx, sy = wrist_rgb.shape[1] / 640, wrist_rgb.shape[0] / 480
+    for k in range(1, n):
+        cx, cy = cents[k][0] / sx, cents[k][1] / sy
+        if stats[k][4] / (sx * sy) > 10000 and 270 <= cx <= 520 and 150 <= cy <= 330:
+            return True
+    return False
 
 
 class Watcher:
@@ -175,6 +221,7 @@ class Watcher:
     # Studio's normalized joint ranges: body joints -100..100, gripper 0..100.
     LOW = np.array([-100, -100, -100, -100, -100, 0], np.float32)
     HIGH = np.full(6, 100, np.float32)
+    GRIP_CLOSED = 5.0  # gripper commands at or below this are "closing", left alone by gripper_gain
 
     def __init__(self, inspector: Inspector, cfg: dict, fps: float):
         self.inspector, self.cfg = inspector, cfg
@@ -182,6 +229,12 @@ class Watcher:
         self.sample_every = max(1, int(fps / 10))
         self.stop = None  # set to runtime.stop
         self.save_dir: Path | None = None  # set by the cell: runs/<time>/nearspot
+        self.gripper_gain = 1.0  # set by the cell from policy.gripper_gain
+        self.debug = None  # cell/debugview.py, with --debug
+        self.close_gate = False  # set by the cell from policy.close_gate
+        self.gated = 0           # actions whose close was held back, this run
+        self.source = None
+        self._last_debug = 0.0
         self.phase_tag = ""
         self.begin("home", None)
 
@@ -200,7 +253,15 @@ class Watcher:
         self.motion: list[tuple] = []  # (t, state, action_sent, loop_s, sleep_s, stale) per tick
         self.speed_ema = 0.0
         self.saved_near = 0
+        self.saved_track = 0
+        self.last_track_save = 0.0
         self.last_near_save = 0.0
+        self.grip_max = 0.0
+        self.grasped_at: float | None = None
+        self.gated = 0
+        self.brick_ready = False
+        self.gate_open = False      # the close gate let this attempt's close through
+        self._last_gate_check = 0.0
 
     def on_action_ready(self, *, action, step):
         """Last check before a policy action reaches the arm.
@@ -211,6 +272,22 @@ class Watcher:
         action = np.asarray(action, np.float32)
         if not np.all(np.isfinite(action)):
             raise ValueError(f"policy produced a non-finite action at step {step}: {action}")
+        if self.close_gate and self.state is not None and not self.gate_open:
+            grip = float(self.state[5])
+            if action[5] < grip - 3.0 and grip > 15.0:  # the policy wants to close an open claw
+                if self.brick_ready:
+                    self.gate_open = True  # brick in the gap: let this grasp happen
+                else:
+                    action = action.copy()
+                    action[5] = grip  # hold the opening; the policy keeps approaching
+                    self.gated += 1
+        if self.gripper_gain != 1.0 and action[5] > self.GRIP_CLOSED:
+            # The policy opens the jaws only to ~20 where the demos opened ~35, so the
+            # fingers land on the brick instead of around it. Widen every "open"
+            # command; closing commands (near 0) pass through unchanged.
+            g = self.GRIP_CLOSED + (action[5] - self.GRIP_CLOSED) * self.gripper_gain
+            action = action.copy()
+            action[5] = g
         return np.clip(action, self.LOW, self.HIGH)
 
     def on_tick(self, event):
@@ -224,6 +301,17 @@ class Watcher:
             speed = float(np.max(np.abs(state - self.prev[1]))) / (now - self.prev[0])  # gripper included
         self.prev = (now, state)
         self.state = state
+        if self.close_gate and event.camera_frames and "wrist" in event.camera_frames and now - self._last_gate_check > 0.1:
+            self._last_gate_check = now
+            self.brick_ready = brick_in_jaws(event.camera_frames["wrist"].data)
+        if self.debug is not None and now - self._last_debug > 0.1:
+            self._last_debug = now
+            plan = None
+            try:
+                plan = self.source.action_queue.peek_remaining() if self.source is not None else None
+            except Exception:  # noqa: BLE001
+                pass
+            self.debug.update(state=state, cmd=sent, plan=plan)
         # Smoothed over ~0.15 s: per-tick speed at 90 Hz is noisy.
         self.speed_ema = 0.85 * self.speed_ema + 0.15 * speed
         if self.done:
@@ -239,6 +327,8 @@ class Watcher:
         self.still = self.still + 1 if still else 0
         if at_spot and event.camera_frames:
             self._save_near_spot(now, event.camera_frames)
+        elif event.camera_frames:
+            self._save_track(now, event.camera_frames)
 
         if self.in_hold and not still:
             self.in_hold = False
@@ -265,6 +355,20 @@ class Watcher:
             home_still = self.speed_ema <= float(self.cfg["still_speed"])
             self.home_still = self.home_still + 1 if at_home and home_still else 0
             if self.left_home and self.home_still >= self.hold_ticks:
+                self._finish()
+        elif self.end == "lifted":
+            # Grasp-only policy ("pick up the brick"): done once the gripper has closed
+            # well below its widest and, a moment later, the arm is held still (lifted).
+            self.grip_max = max(self.grip_max, float(state[5]))
+            # Closed for real: opened wide first, then shut (a held brick reads ~2, empty ~1.2).
+            # A relative drop fired on the policy just adjusting the opening (50 -> 41).
+            if (self.grasped_at is None and self.grip_max > float(self.cfg.get("grasp_open_min", 25.0))
+                    and float(state[5]) < float(self.cfg.get("grasp_closed_max", 12.0))):
+                self.grasped_at = now
+            elif self.grasped_at is not None and float(state[5]) > float(self.cfg.get("grasp_closed_max", 12.0)):
+                self.grasped_at = None  # opened again: not holding yet
+            if (self.grasped_at is not None and now - self.grasped_at >= float(self.cfg.get("lift_wait_s", 1.0))
+                    and self.still >= self.hold_ticks):
                 self._finish()
         elif self.end == "holds":
             v = self.inspector.verdict
@@ -293,6 +397,20 @@ class Watcher:
             if cam in frames:
                 cv2.imwrite(str(self.save_dir / f"{self.phase_tag}_{self.saved_near:03d}_{cam}.jpg"),
                             cv2.cvtColor(frames[cam].data, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    def _save_track(self, now: float, frames: dict):
+        """Top and wrist frames once a second away from the spots (max 180), to see grasp attempts afterwards."""
+        if self.save_dir is None or self.saved_track >= 180 or now - self.last_track_save < 1.0:
+            return
+        self.last_track_save = now
+        self.saved_track += 1
+        d = self.save_dir.parent / "track"
+        d.mkdir(parents=True, exist_ok=True)
+        g = float(self.state[5]) if self.state is not None else float("nan")
+        for cam in ("top", "wrist"):
+            if cam in frames:
+                cv2.imwrite(str(d / f"{self.phase_tag}_{time.strftime('%H%M%S')}_g{g:02.0f}_{cam}.jpg"),
+                            cv2.cvtColor(frames[cam].data, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 70])
 
     def _finish(self):
         self.done = True
@@ -418,8 +536,60 @@ class KeepOpen:
     def __getattr__(self, name):
         return getattr(self._model, name)
 
+    def __call__(self, *args, **kwargs):  # RTCExecution calls the model directly
+        return self._model(*args, **kwargs)
+
     def close(self):
         pass
+
+
+def rtc_source(model, pcfg: dict, task: str):
+    """PolicySource with Real-Time Chunking (Robotics AI Suite, pi05_with_rtc.md).
+
+    Inference runs on a background thread while the arm plays the queued
+    actions, so the loop never waits for the policy. Each new chunk is denoised
+    to continue the unexecuted tail of the previous one (prefix guidance), so
+    there is no stale-chunk jump like plain async mode had. Needs an export
+    with RTC inputs: scripts/export_rtc.py.
+    """
+    from physicalai.inference.callbacks import RTCLatencyTracker
+    from physicalai.runtime import PolicySource, RTCActionQueue, RTCExecution
+
+    rcfg = pcfg.get("rtc") or {}
+    # The tracker measures inference latency; RTCExecution turns its worst case
+    # into how many queued actions will already be gone when the chunk lands.
+    tracker = next((c for c in model.callbacks if isinstance(c, RTCLatencyTracker)), None)
+    if tracker is None:
+        tracker = RTCLatencyTracker(window_size=int(rcfg.get("latency_window", 30)))
+        model.callbacks.append(tracker)
+    execution = RTCExecution(
+        fps=float(pcfg["fps"]),
+        execution_horizon=int(rcfg.get("execution_horizon", 15)),
+        max_guidance_weight=float(rcfg.get("max_guidance_weight", 5.0)),
+        latency_tracker=tracker,
+    )
+    return PolicySource(KeepOpen(model), execution, RTCActionQueue(), task=task)
+
+
+def rtc_export_dir(export_dir: Path) -> Path:
+    """The RTC export next to a plain one (exports/openvino -> exports/openvino-rtc)."""
+    if _has_rtc_inputs(export_dir):
+        return export_dir
+    rtc = export_dir.with_name(export_dir.name + "-rtc")
+    if (rtc / "manifest.json").exists() and _has_rtc_inputs(rtc):
+        return rtc
+    raise SystemExit(f"policy.mode: rtc needs an RTC export of {export_dir}; make it with "
+                     f"scripts/export_rtc.py {export_dir.parent.parent}")
+
+
+def _has_rtc_inputs(export_dir: Path) -> bool:
+    import openvino as ov
+
+    xml = next((p for p in export_dir.glob("*.xml") if "tokenizer" not in p.name), None)
+    if xml is None:
+        return False
+    names = {n for i in ov.Core().read_model(xml).inputs for n in i.get_names()}
+    return "prev_chunk_left_over" in names
 
 
 class Cell:
@@ -433,7 +603,7 @@ class Cell:
         self.views = self.icfg["views"]  # this brick's views: crop boxes follow the tags when a camera moved
         self.show = show
         self.mode = "handover" if drop_model is not None else self.pcfg["drop"]
-        needed = ["home"] + (["good_bowl", "defective_bowl"] if self.mode == "scripted" else [])
+        needed = ["home"] + (["good_bowl", "defective_bowl"] if self.mode in ("scripted", "grasp") else [])
         missing = [p for p in needed if p not in poses]
         if missing:
             raise SystemExit(f"poses missing from {cfg['poses']}: {missing}; record them with ./biddy poses record")
@@ -442,16 +612,27 @@ class Cell:
             raise SystemExit(f"no anomaly model for any inspection view {self.insp_views}; train with ./biddy anomaly")
 
         def source(m):
-            execution = AsyncExecution() if self.pcfg.get("mode") == "async" else SyncExecution()
+            mode = self.pcfg.get("mode", "sync")
+            if mode == "rtc":
+                return rtc_source(m, self.pcfg, self.pick_task)
+            execution = AsyncExecution() if mode == "async" else SyncExecution()
             return PolicySource(KeepOpen(m), execution, task=self.pick_task)
 
         self.tasks = self.pcfg["tasks"]
         self.pick_task = self.tasks.get("pick") or self.tasks["good"]
+        # --collect good|defective: a known brick; never switch bowls, keep every hold's crops.
+        self.collect = cfg.get("collect")
+        if self.mode == "grasp":  # grasp-only policy; the script inspects and drops
+            self.pick_task = self.tasks.get("grasp") or "pick up the brick"
+        elif self.collect:
+            self.pick_task = self.tasks[self.collect]
         self.models = [model] + ([drop_model] if drop_model is not None else [])
         pick_source = source(model)
         self.source = SwitchSource({"pick": pick_source,
                                     "drop": source(drop_model) if drop_model is not None else pick_source})
         self.inspector = Inspector(anomaly, self.icfg["views"], self.icfg, self._on_defective)
+        if self.collect:
+            self.inspector.save_dir = Path("data/live") / self.collect
         from physicalai.runtime import LinearInterpolator
 
         # The SO-101 ignores goal_time and jumps to each target, so 30 Hz policy
@@ -463,6 +644,10 @@ class Cell:
         tick_hz = float(self.pcfg["fps"]) * self.interpolate
         self.watcher = Watcher(self.inspector, self.icfg, tick_hz)
         self.watcher.save_dir = log.dir / "nearspot"
+        self.watcher.gripper_gain = float(self.pcfg.get("gripper_gain", 1.0))
+        # Wrist-camera close gate: the claw only closes with a coloured brick in the jaw gap
+        # (the policy otherwise closes on the claw's own shadow on the white card).
+        self.watcher.close_gate = bool(self.pcfg.get("close_gate", False))
         # The fine-tuned policy's actions are ~7x jerkier than the demos; an EMA on
         # the 30 Hz actions (reset at every run) smooths them before the safety
         # check. Lower alpha = smoother but laggier; 1 = off.
@@ -474,15 +659,22 @@ class Cell:
                                     cameras=cameras, callbacks=callbacks,
                                     interpolator=LinearInterpolator(multiplier=self.interpolate))
         self.watcher.stop = self.runtime.stop
+        self.watcher.source = self.source
+        self.debug = None  # cell/debugview.py, with --debug
         self.insp_cam = cameras[self.icfg["views"][self.insp_views[0]]["camera"]]
         self.stop_event = threading.Event()
 
     def _on_defective(self):
         """Inspector thread: a face failed. In task_switch mode, steer to the defective bowl now."""
-        if self.mode == "task_switch":
+        if self.mode == "task_switch" and not self.collect:
             self.source.current.set_task(self.tasks["defective"])
 
+    def _dbg(self, phase: str, detail: str = ""):
+        if self.debug is not None:
+            self.debug.set_phase(phase, detail)
+
     def _policy(self, phase: str, task: str, timeout: float, end: str, holds: int = 0) -> tuple[bool, float]:
+        self._dbg(f"policy {phase}", f'"{task}"')
         self.source.use(phase)
         self.source.current.set_task(task)
         self.watcher.begin(end, self.poses["home"], holds)
@@ -522,13 +714,14 @@ class Cell:
         grip = [r[1][5] for r in rows]
         print(f"  motion: {len(rows)} ticks in {rows[-1][0] - t0:.1f}s, {late} late ({100 * late / len(rows):.0f}%), "
               f"gripper commanded {min(grip_cmd, default=float('nan')):.1f}-{max(grip_cmd, default=float('nan')):.1f}, "
-              f"measured {min(grip):.1f}-{max(grip):.1f} -> {path.name}")
+              f"measured {min(grip):.1f}-{max(grip):.1f} -> {path.name}"
+              + (f"; close gate held {self.watcher.gated} closes" if self.watcher.close_gate else ""))
 
-    def _move(self, pose: np.ndarray, gripper: float | None = None) -> float:
+    def _move(self, pose: np.ndarray, gripper: float | None = None, tolerance: float = 3.0) -> float:
         """Scripted move; raises StopCell if it is stopped or does not arrive."""
         t0 = time.monotonic()
         ok = poses_mod.move_to(self.arm, pose, speed=float(self.cfg["scripted"]["speed"]), gripper=gripper,
-                               stop=self.stop_event)
+                               stop=self.stop_event, tolerance=tolerance)
         if not ok:
             raise StopCell("stopped" if self.stop_event.is_set() else
                            f"arm did not reach {np.round(pose, 1).tolist()}; check for a collision or a stuck joint")
@@ -574,6 +767,97 @@ class Cell:
         c.tag_note = "; ".join(notes)
         return waited
 
+    def _inspection_stops(self) -> list[tuple[str, int, np.ndarray]]:
+        """(view, index, 5-joint pose): the first two recorded poses of each inspection view,
+        skipping the long-brick ones (wrist rolled ~50)."""
+        stops = [(v, i, np.asarray(p, np.float32)) for v in self.insp_views
+                 for i, p in enumerate(self.icfg["views"][v].get("poses") or []) if abs(float(p[4])) < 20]
+        return [s for n, s in enumerate(stops) if sum(1 for t in stops[:n] if t[0] == s[0]) < 2]
+
+    def _scripted_inspection(self, c: Cycle, empty: dict) -> bool:
+        """Grasp mode: show the held brick at fixed poses and score it there.
+
+        Every crop has the same framing (the anomaly models are trained on these
+        poses), unlike holds the policy happens to pause in. Fills the verdict
+        through the inspector; returns False if no pose showed a brick.
+        """
+        views = self.views
+        n_frames = int(self.icfg.get("frames", 3))
+        settle = float(self.icfg.get("scripted_settle_s", 0.6))
+        insp = self.inspector
+        # Holds the watcher saw during the grasp don't count: only the fixed poses do.
+        insp.reset(self.poses["home"], insp.backgrounds, views, empty)
+        t0 = time.monotonic()
+        found = self._show_at_stops(empty, n_frames, settle, base=0)
+        # Regrip only a brick that passed so far: a failed face already decides "defective".
+        if self.icfg.get("scripted_regrip") and found and (self.collect or not insp.verdict.defective):
+            if self._regrip():
+                found += self._show_at_stops(empty, n_frames, settle, base=100, tag="after regrip ")
+        c.episode_s += time.monotonic() - t0
+        return found > 0
+
+    def _regrip(self) -> bool:
+        """Set the brick down at the regrip spot, roll the wrist, grasp it again.
+
+        The script knows where the brick is (it is holding it), so this needs no
+        vision: down at poses.regrip, open, up to regrip_above, roll by
+        inspection.regrip_roll (normalized units; ~50 = 90 degrees), down, close,
+        up. The faces the jaws covered are then shown at the same poses.
+        """
+        self._dbg("regrip", "set down, roll, grasp again")
+        if "regrip" not in self.poses or "regrip_above" not in self.poses:
+            print("  regrip: poses regrip/regrip_above not recorded; skipping")
+            return False
+        open_g = float(self.cfg["scripted"]["gripper_open"])
+        roll = float(self.icfg.get("regrip_roll", 50.0))
+        above, down = self.poses["regrip_above"].copy(), self.poses["regrip"].copy()
+        above_r, down_r = above.copy(), down.copy()
+        above_r[4] = float(np.clip(above_r[4] + roll, -100, 100))
+        down_r[4] = float(np.clip(down_r[4] + roll, -100, 100))
+        self._move(above, gripper=0.0, tolerance=8.0)
+        self._move(down, gripper=0.0, tolerance=8.0)
+        self._move(down, gripper=open_g, tolerance=8.0)
+        self._move(above, gripper=open_g, tolerance=8.0)
+        self._move(above_r, gripper=open_g, tolerance=8.0)
+        self._move(down_r, gripper=open_g, tolerance=8.0)
+        self._move(down_r, gripper=0.0, tolerance=8.0)
+        time.sleep(0.3)
+        self._move(above_r, gripper=0.0, tolerance=8.0)
+        print(f"  regrip: rolled {roll:+.0f} and grasped again")
+        return True
+
+    def _show_at_stops(self, empty: dict, n_frames: int, settle: float, base: int, tag: str = "") -> int:
+        """Show the held brick at every inspection stop; returns how many showed a brick."""
+        views, insp = self.views, self.inspector
+        found = 0
+        for k, (view, i, p) in enumerate(self._inspection_stops()):
+            if view not in insp.models:
+                continue
+            self._dbg("inspect", f"{tag}{view} pose {i}")
+            self._move(np.concatenate([p[:5], [0.0]]).astype(np.float32), gripper=0.0)
+            time.sleep(settle)
+            cam = views[view]["camera"]
+            samples = []
+            for _ in range(n_frames):
+                rgb = score_crop(self.cameras[cam].read().data, views[view], empty.get(cam))
+                if rgb is None:
+                    continue
+                r = insp.models[view](rgb)
+                insp.infer_ms.append(r.latency_ms)
+                samples.append((r.score, rgb))
+                time.sleep(0.1)
+            if not samples:
+                print(f"  {tag}{view} pose {i}: no brick found")
+                continue
+            found += 1
+            with insp.lock:
+                hold_id = 1000 + base + k
+                insp.kinds[hold_id] = view
+                insp.samples[hold_id] = samples
+                insp._close(hold_id)  # median into the verdict; saves crops in --collect
+            print(f"  {tag}{view} pose {i}: " + " ".join(f"{s:.3f}" for s, _ in samples))
+        return found
+
     # one brick
 
     def cycle(self, i: int) -> Cycle:
@@ -590,8 +874,23 @@ class Cell:
             c.regrasps = attempt
             # Arm at home: the inspection view is empty; that is the presence reference.
             frames = {cam: self.cameras[cam].read().data for cam in {views[v]["camera"] for v in self.insp_views}}
+            if self.debug is not None and "top" in self.cameras:
+                self.debug.set_empty_top(None)  # the bricks are on the table now: diff against the first frame of the run
             self.inspector.reset(self.poses["home"], {v: view_crop(frames[views[v]["camera"]], views[v])
                                                       for v in self.insp_views}, views, frames)
+            if self.mode == "grasp":
+                done, c.episode_s = self._policy("pick", self.pick_task, timeout, "lifted")
+                if not done:
+                    c.outcome, c.note = "no_brick", f"no grasp within {timeout:.0f}s"
+                    c.home_s = self._move(self.poses["home"], gripper=float(self.cfg["scripted"]["gripper_open"]))
+                    continue
+                c.note = ""  # an earlier missed attempt's note
+                found = self._scripted_inspection(c, frames)
+                if not found:
+                    c.outcome, c.note = "no_brick", "no brick in any inspection crop"
+                    c.home_s = self._move(self.poses["home"], gripper=float(self.cfg["scripted"]["gripper_open"]))
+                    continue
+                break
             if self.mode == "task_switch":
                 done, c.episode_s = self._policy("pick", self.pick_task, timeout, "home")
             else:
@@ -626,7 +925,18 @@ class Cell:
             c.crop = self.log.save_crop(c, worst[2])
             self._preview(worst[2], c.verdict, c.score)
 
-        if self.mode == "task_switch":
+        if self.mode == "grasp":
+            t0 = time.monotonic()
+            label = self.collect or c.verdict  # --collect: the known bowl
+            self._dbg("drop", f"{label} bowl (verdict {c.verdict}, worst {c.worst_view} {c.score:.3f})")
+            bowl = self.poses[f"{label}_bowl"]
+            # Stretched out over a bowl the arm sags several units: arriving roughly is enough.
+            self._move(bowl, gripper=0.0, tolerance=8.0)  # keep squeezing the brick
+            self._move(bowl, gripper=float(self.cfg["scripted"]["gripper_open"]), tolerance=8.0)
+            c.drop_s = time.monotonic() - t0
+            c.home_s = self._move(self.poses["home"])
+            c.outcome = "sorted"
+        elif self.mode == "task_switch":
             c.outcome = "sorted" if done else "timeout"
             if not done:
                 c.note = f"not back home after {timeout:.0f}s"
@@ -735,6 +1045,8 @@ def build_real(cfg: dict):
 
     def load(spec, role):
         export_dir = studio.resolve_policy_dir(spec, cfg["studio"]["db"])
+        if cfg["policy"].get("mode") == "rtc":
+            export_dir = rtc_export_dir(export_dir)
         check_cameras(export_dir, cfg["studio"]["cameras"])
         return load_policy(export_dir, cfg, role)
 
@@ -772,13 +1084,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="station.yaml")
     ap.add_argument("--cycles", type=int, help="stop after this many bricks (default: until Ctrl+C)")
-    ap.add_argument("--drop", choices=["task_switch", "scripted"], help="override policy.drop")
+    ap.add_argument("--drop", choices=["task_switch", "scripted", "grasp"], help="override policy.drop")
     ap.add_argument("--policy-device", help="override policy.device")
     ap.add_argument("--anomaly-device", help="override inspection.device")
+    ap.add_argument("--policy-mode", choices=["sync", "async", "rtc"], help="override policy.mode")
     ap.add_argument("--show", action="store_true", help="preview window with each brick's worst face")
     ap.add_argument("--mock", action="store_true", help="no hardware: mock arm, cameras and policy")
     ap.add_argument("--mock-miss-every", type=int, default=0, help="mock: every n-th pick grabs nothing")
     ap.add_argument("--mock-policy", help="mock: drive the mock arm with this exported policy instead of the scripted one")
+    ap.add_argument("--collect", choices=["good", "defective"],
+                    help="known brick: stay on that bowl's task and save every scored crop to data/live/<label>/<view>/")
+    ap.add_argument("--debug", action="store_true",
+                    help="debug frames even if switched off on the debug page (see ./biddy debug-server)")
     ap.add_argument("--no-tags", action="store_true", help="skip the AprilTag check and the crops that follow the tags (station.yaml tags)")
     args = ap.parse_args()
 
@@ -787,8 +1104,11 @@ def main():
         cfg["policy"]["drop"] = args.drop
     if args.policy_device:
         cfg["policy"]["device"] = args.policy_device
+    if args.policy_mode:
+        cfg["policy"]["mode"] = args.policy_mode
     if args.anomaly_device:
         cfg["inspection"]["device"] = args.anomaly_device
+    cfg["collect"] = args.collect
 
     poses = {k: np.asarray(v, np.float32) for k, v in poses_mod.load(cfg["poses"]).items()}
     if args.mock:
@@ -797,8 +1117,11 @@ def main():
         poses = {k: np.asarray(v, np.float32) for k, v in MOCK_POSES.items()}  # the mock policy's own route
         arm, cameras, model, drop_model = build_mock(cfg, poses, args.mock_miss_every)
         if args.mock_policy:  # real exported policy (InferenceModel) driving the mock arm
-            check_cameras(Path(args.mock_policy), cfg["studio"]["cameras"])
-            model = load_policy(Path(args.mock_policy), cfg)
+            mock_dir = studio.resolve_policy_dir(args.mock_policy, cfg["studio"]["db"])
+            if cfg["policy"].get("mode") == "rtc":
+                mock_dir = rtc_export_dir(mock_dir)
+            check_cameras(mock_dir, cfg["studio"]["cameras"])
+            model = load_policy(mock_dir, cfg)
     else:
         arm, cameras, model, drop_model = build_real(cfg)
     anomaly = load_anomaly(cfg)
@@ -810,12 +1133,21 @@ def main():
 
     log = RunLog(cfg["runs_dir"], cfg)
     cell = Cell(cfg, arm, cameras, model, anomaly, poses, log, show=args.show, drop_model=drop_model, guard=guard)
+    # Debug frames go to runs/debug_latest.jpg for the always-on page (scripts/debug_server.py,
+    # ./biddy debug-server), unless it was switched off there (runs/.debug_off). --debug forces it.
+    runs = Path(cfg["runs_dir"])
+    if args.debug or not (runs / ".debug_off").exists():
+        from cell.debugview import DebugView
+
+        cell.debug = cell.watcher.debug = DebugView(cameras, log.dir, latest=runs / "debug_latest.jpg")
     try:
         cell.run(args.cycles)
     except KeyboardInterrupt:
         cell.stop_event.set()
         print("\nstopped")
     finally:
+        if cell.debug is not None:
+            cell.debug.close()
         for m in cell.models:
             close = getattr(m, "close", None)
             if close is not None:

@@ -10,6 +10,8 @@ Poses, in Studio's normalized units (-100..100, gripper 0..100):
     inspect         brick held in front of the inspection camera
     good_bowl       gripper over the good bowl (scripted drop)
     defective_bowl  gripper over the defective bowl (scripted drop)
+    regrip_above    gripper ~5 cm above a clear spot on the card (scripted regrip)
+    regrip          the same spot, fingertips at the table (where the brick is set down)
 The gripper value is kept from the recording; the drop opens it separately.
 
 Studio must not be holding the arm (close its robot session first).
@@ -24,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-POSE_NAMES = ["home", "inspect", "good_bowl", "defective_bowl"]
+POSE_NAMES = ["home", "inspect", "good_bowl", "defective_bowl", "regrip_above", "regrip"]
 GRIPPER = 5
 
 

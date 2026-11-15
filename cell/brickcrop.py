@@ -25,6 +25,18 @@ MARGIN = 0.15
 MASK_GREY = 128    # fill outside the brick when a view sets mask: true      # of the box size, on every side
 
 
+MAX_SIDE = 320     # px; brick crops in the live data are 111-256 px
+MIN_JAW = 0.05     # a held brick always shows some jaw pink (live crops: >= 0.15)
+MAX_JAW = 0.35     # a crop more than this much gripper pink is the jaws, not a brick
+
+
+def jaw_fraction(rgb: np.ndarray) -> float:
+    """Share of pixels that are gripper pink, with a looser saturation than brick_mask (blurred jaws)."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, s = hsv[..., 0], hsv[..., 1]
+    return float((((h >= 140) | (h <= 8)) & (s > 40)).mean())
+
+
 def brick_mask(rgb: np.ndarray, background: np.ndarray) -> np.ndarray:
     """uint8 mask (255 = brick candidate) of the same size as rgb."""
     if background.shape != rgb.shape:
@@ -103,7 +115,14 @@ def brick_crop(rgb: np.ndarray, background: np.ndarray, roi: list[int] | None = 
     if box is None:
         return None
     x, y, w, h = box
+    if w > MAX_SIDE:  # a held brick is ~110-260 px; a box this big is lighting or arm, not a brick
+        return None
     out = rgb[y:y + h, x:x + w]
+    jaws = jaw_fraction(out)
+    if jaws > MAX_JAW:  # the "brick" is the empty jaws (blurred edges escape the colour mask)
+        return None
+    if jaws < MIN_JAW:  # no jaws around it: not a brick in the gripper (e.g. an AprilTag that shifted)
+        return None
     if not mask_background:
         return out
     H, W = rgb.shape[:2]
