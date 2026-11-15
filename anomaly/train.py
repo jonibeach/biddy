@@ -38,15 +38,19 @@ MODELS = {
     "patchcore": ("anomalib.models", "Patchcore"),
     "padim": ("anomalib.models", "Padim"),
     "efficient_ad": ("anomalib.models", "EfficientAd"),
+    "dinomaly": ("anomalib.models", "Dinomaly"),  # DINOv2 ViT-B/14 + trained decoder; use --size 392 (14 * 28)
 }
 
 
-def build_model(name: str, coreset: float):
+def build_model(name: str, coreset: float, size: int):
     import importlib
 
     module, cls = MODELS[name]
+    model_cls = getattr(importlib.import_module(module), cls)
     kwargs = {"coreset_sampling_ratio": coreset} if name == "patchcore" else {}
-    return getattr(importlib.import_module(module), cls)(**kwargs)
+    if name == "dinomaly":  # its default resizes to 448 and center-crops 392: keep the whole brick crop
+        kwargs["pre_processor"] = model_cls.configure_pre_processor(image_size=(size, size), crop_size=size)
+    return model_cls(**kwargs)
 
 
 def heldout_images(datamodule) -> list[tuple[str, int]]:
@@ -206,6 +210,8 @@ def main():
     ap.add_argument("--model", default="patchcore", choices=sorted(MODELS))
     ap.add_argument("--size", type=int, default=256, help="square model input size")
     ap.add_argument("--epochs", type=int, default=1, help="Patchcore/Padim need 1; EfficientAd ~ 20+")
+    ap.add_argument("--steps", type=int, default=3000,
+                    help="dinomaly only: training steps (replaces --epochs; anomalib's default is 5000)")
     ap.add_argument("--int8", action="store_true", help="also export an NNCF INT8 model")
     ap.add_argument("--coreset", type=float, default=0.01,
                     help="Patchcore memory bank as a fraction of all patches. Its greedy selection is the slow "
@@ -244,9 +250,14 @@ def main():
             seed=0,
         )
 
-    dm = datamodule(1 if args.model == "efficient_ad" else 8)  # EfficientAd requires batch size 1
-    model = build_model(args.model, args.coreset)
-    engine = Engine(max_epochs=args.epochs, default_root_dir=work, **trainer_device(args.accelerator))
+    # EfficientAd requires batch size 1; Dinomaly's learning rate is tuned for 16.
+    dm = datamodule({"efficient_ad": 1, "dinomaly": 16}.get(args.model, 8))
+    model = build_model(args.model, args.coreset, args.size)
+    length = {"max_epochs": args.epochs}
+    if args.model == "dinomaly":  # step-based; validate (sets score normalization) 3 times, not every short epoch
+        length = {"max_epochs": -1, "max_steps": args.steps, "check_val_every_n_epoch": None,
+                  "val_check_interval": max(1, args.steps // 3)}
+    engine = Engine(**length, default_root_dir=work, **trainer_device(args.accelerator))
     engine.fit(model=model, datamodule=dm)
 
     # A fixed input size is required: with the default dynamic shape the exported
