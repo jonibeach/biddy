@@ -47,6 +47,13 @@ def policy_obs(export_dir: Path, task: str) -> dict:
         elif a.get("ftype") == "STATE":
             obs[a["name"]] = np.zeros((1, *a["shape"]), np.float32)
     obs["task"] = [task]
+    # An RTC export (scripts/export_rtc.py) also takes the previous chunk; zeros
+    # with ~0 guidance is "no previous chunk", as RTCExecution sends on its first call.
+    rtc = {"inference_delay": np.int64(0), "max_guidance_weight": np.float32(1e-8), "execution_horizon": np.int64(1)}
+    for f in manifest["model"]["input_features"]:
+        a = f.get("init_args", f)
+        if a.get("name") == "prev_chunk_left_over":
+            obs.update(rtc, prev_chunk_left_over=np.zeros((1, *a["shape"]), np.float32))
     return obs
 
 
