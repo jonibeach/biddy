@@ -571,15 +571,27 @@ def rtc_source(model, pcfg: dict, task: str):
     return PolicySource(KeepOpen(model), execution, RTCActionQueue(), task=task)
 
 
-def rtc_export_dir(export_dir: Path) -> Path:
-    """The RTC export next to a plain one (exports/openvino -> exports/openvino-rtc)."""
+RTC_POLICIES = {"smolvla", "pi05", "pi0"}  # flow-matching policies; RTC steers their denoising
+
+
+def rtc_export_dir(export_dir: Path) -> tuple[Path, bool]:
+    """The RTC export next to a plain one (exports/openvino -> exports/openvino-rtc).
+
+    Returns (export dir, RTC on). A policy RTC cannot steer (ACT predicts its
+    chunk in one pass, ~8 ms) keeps its plain export and runs sync, so
+    policy.mode: rtc can stay set while switching models.
+    """
     if _has_rtc_inputs(export_dir):
-        return export_dir
+        return export_dir, True
+    policy = json.loads((export_dir / "manifest.json").read_text())["policy"]["name"].lower()
+    if policy not in RTC_POLICIES:
+        print(f"policy.mode: rtc: {policy} is not a flow-matching policy, so no RTC; running it sync")
+        return export_dir, False
     rtc = export_dir.with_name(export_dir.name + "-rtc")
     if (rtc / "manifest.json").exists() and _has_rtc_inputs(rtc):
-        return rtc
+        return rtc, True
     raise SystemExit(f"policy.mode: rtc needs an RTC export of {export_dir}; make it with "
-                     f"scripts/export_rtc.py {export_dir.parent.parent}")
+                     f"./biddy export-rtc {export_dir.parent.parent}")
 
 
 def _has_rtc_inputs(export_dir: Path) -> bool:
@@ -613,7 +625,7 @@ class Cell:
 
         def source(m):
             mode = self.pcfg.get("mode", "sync")
-            if mode == "rtc":
+            if mode == "rtc" and getattr(m, "rtc", False):
                 return rtc_source(m, self.pcfg, self.pick_task)
             execution = AsyncExecution() if mode == "async" else SyncExecution()
             return PolicySource(KeepOpen(m), execution, task=self.pick_task)
@@ -1045,10 +1057,13 @@ def build_real(cfg: dict):
 
     def load(spec, role):
         export_dir = studio.resolve_policy_dir(spec, cfg["studio"]["db"])
+        rtc = False
         if cfg["policy"].get("mode") == "rtc":
-            export_dir = rtc_export_dir(export_dir)
+            export_dir, rtc = rtc_export_dir(export_dir)
         check_cameras(export_dir, cfg["studio"]["cameras"])
-        return load_policy(export_dir, cfg, role)
+        model = load_policy(export_dir, cfg, role)
+        model.rtc = rtc  # Cell picks RTCExecution only for models with RTC inputs
+        return model
 
     model = load(cfg["policy"]["model"], "pick")
     drop = cfg["policy"].get("drop_model")
@@ -1118,10 +1133,12 @@ def main():
         arm, cameras, model, drop_model = build_mock(cfg, poses, args.mock_miss_every)
         if args.mock_policy:  # real exported policy (InferenceModel) driving the mock arm
             mock_dir = studio.resolve_policy_dir(args.mock_policy, cfg["studio"]["db"])
+            rtc = False
             if cfg["policy"].get("mode") == "rtc":
-                mock_dir = rtc_export_dir(mock_dir)
+                mock_dir, rtc = rtc_export_dir(mock_dir)
             check_cameras(mock_dir, cfg["studio"]["cameras"])
             model = load_policy(mock_dir, cfg)
+            model.rtc = rtc
     else:
         arm, cameras, model, drop_model = build_real(cfg)
     anomaly = load_anomaly(cfg)

@@ -12,7 +12,7 @@ poses: poses.json  # written by: python -m cell.poses record
 policy:
   # Which Studio model to run: "latest", "latest:<policy>" (e.g. latest:act),
   # a Studio model name, or a path to an exports/openvino folder.
-  model: models/smolvla-ft-grasp55   # grasp-only policy (drop: grasp). Before: smolvla-ft-new52-from-all3 (full routine); tried: smolvla-ft-grasp107 (missed every grasp in grasp mode), smolvla-ft-new52-base (loops on the arm), smolvla-ft-all3-e2, smolvla-ft-all-e2, smolvla-ft-pislong-e3, latest
+  model: act-all187   # Studio ACT model (no language; all 187 episodes). Before: smolvla-ft-grasp55-shadow, smolvla-ft-grasp55; grasp-only policy (drop: grasp). Before: smolvla-ft-new52-from-all3 (full routine); tried: smolvla-ft-grasp107 (missed every grasp in grasp mode), smolvla-ft-new52-base (loops on the arm), smolvla-ft-all3-e2, smolvla-ft-all-e2, smolvla-ft-pislong-e3, latest
   # Optional second policy for the drop phase, e.g. ACT picks and brings the
   # brick to inspection, then SmolVLA sorts it using the verdict's task text.
   # null = the same policy does both.
@@ -24,7 +24,7 @@ policy:
   interpolate: 3           # commands per action: 30 Hz actions -> 90 Hz smooth targets for the SO-101
   precision: auto          # auto (FP16, FP32 if FP16 gives NaN), f16, f32
   fps: 30
-  mode: sync               # sync: plan each chunk from the current frame (async replayed ~140 ms stale chunks: jitter)
+  mode: rtc                # was sync: plan each chunk from the current frame, arm waits ~100 ms per chunk (async replayed ~140 ms stale chunks: jitter)
                            # rtc: Real-Time Chunking (Robotics AI Suite): infer in the background, each chunk
                            #      denoised to continue the last one; no pauses, no seams. Needs
                            #      scripts/export_rtc.py <model>; try with ./biddy run --policy-mode rtc
@@ -140,7 +140,7 @@ tags:
   on_moved: pause          # pause: wait until it is put back; warn: log it and carry on
 
 scripted:
-  speed: 45.0              # units/s for scripted moves (80 shook a brick out of the jaws)
+  speed: 30.0              # units/s for scripted moves (80 and 45 shook bricks out of the jaws)
   gripper_open: 60.0       # gripper value that releases the brick
 
 runs_dir: runs
